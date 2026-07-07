@@ -15,6 +15,7 @@ struct ClaudeStatus {
     var fiveHourResetMin: Int? = nil
     var sevenDayPct: Double? = nil
     var sevenDayResetMin: Int? = nil
+    var needsInput: Bool = false // waiting on a permission/approval prompt
 }
 
 struct CodexStatus {
@@ -26,6 +27,7 @@ struct CodexStatus {
     var weeklyPct: Double? = nil
     var weeklyWindowMin: Int? = nil
     var weeklyResetMin: Int? = nil
+    var needsInput: Bool = false
 }
 
 struct Snapshot {
@@ -61,27 +63,51 @@ final class StatusService {
 
     private var claudeEvent: AgentEvent?
     private var codexEvent: AgentEvent?
+    // "needs input": a permission/approval prompt is on screen, waiting on the
+    // user. Set by an attention event, cleared by the next concrete lifecycle
+    // event (the prompt got answered) or by TTL.
+    private var claudeNeedsInputAt: TimeInterval?
+    private var codexNeedsInputAt: TimeInterval?
     private let workingEventTTL: TimeInterval = 10 * 60
     private let idleEventTTL: TimeInterval = 60
+    private let needsInputTTL: TimeInterval = 5 * 60
 
     private static let workingEvents: Set<String> = [
         "UserPromptSubmit", "PreToolUse", "PostToolUse", "SubagentStart", "SubagentStop",
         "PreCompact", "PostCompact", "WorktreeCreate",
     ]
     private static let idleEvents: Set<String> = [
-        "Stop", "SessionEnd", "SessionStart", "Notification", "Elicitation",
+        "Stop", "SessionEnd", "SessionStart",
+    ]
+    // Claude fires Notification when it needs approval / your input; Codex
+    // fires PermissionRequest. Elicitation covers MCP prompt dialogs.
+    private static let attentionEvents: Set<String> = [
+        "Notification", "Elicitation", "PermissionRequest",
     ]
 
     /// Called by the /event endpoint. Unknown event names are ignored.
     func recordEvent(agent: String, event: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        let now = Date().timeIntervalSince1970
+        if Self.attentionEvents.contains(event) {
+            if agent == "claude" { claudeNeedsInputAt = now }
+            else if agent == "codex" { codexNeedsInputAt = now }
+            return
+        }
         let state: String
         if Self.workingEvents.contains(event) { state = "working" }
         else if Self.idleEvents.contains(event) { state = "idle" }
         else { return }
-        lock.lock()
-        let ev = AgentEvent(state: state, at: Date().timeIntervalSince1970)
-        if agent == "claude" { claudeEvent = ev } else if agent == "codex" { codexEvent = ev }
-        lock.unlock()
+        let ev = AgentEvent(state: state, at: now)
+        // any concrete lifecycle event means the prompt (if any) was answered
+        if agent == "claude" { claudeEvent = ev; claudeNeedsInputAt = nil }
+        else if agent == "codex" { codexEvent = ev; codexNeedsInputAt = nil }
+    }
+
+    private func needsInput(_ at: TimeInterval?, now: TimeInterval) -> Bool {
+        guard let at = at else { return false }
+        return now - at < needsInputTTL
     }
 
     /// Event override, applied on top of the log-derived status. "offline"
@@ -148,6 +174,8 @@ final class StatusService {
         }
         snap.claude.status = overrideStatus(snap.claude.status, with: claudeEvent, now: now)
         snap.codex.status = overrideStatus(snap.codex.status, with: codexEvent, now: now)
+        snap.claude.needsInput = needsInput(claudeNeedsInputAt, now: now)
+        snap.codex.needsInput = needsInput(codexNeedsInputAt, now: now)
         snap.musicPlaying = musicPlayingProvider?() ?? false
         return snap
     }
@@ -312,6 +340,7 @@ extension Snapshot {
                 "five_hour_reset_min": num(claude.fiveHourResetMin),
                 "seven_day_pct": num(claude.sevenDayPct),
                 "seven_day_reset_min": num(claude.sevenDayResetMin),
+                "needs_input": claude.needsInput,
             ],
             "codex": [
                 "status": codex.status,
@@ -322,6 +351,7 @@ extension Snapshot {
                 "weekly_pct": num(codex.weeklyPct),
                 "weekly_window_min": num(codex.weeklyWindowMin),
                 "weekly_reset_min": num(codex.weeklyResetMin),
+                "needs_input": codex.needsInput,
             ],
         ]
         return (try? JSONSerialization.data(withJSONObject: dict)) ?? Data("{}".utf8)

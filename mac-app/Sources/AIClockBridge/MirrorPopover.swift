@@ -72,6 +72,8 @@ final class MirrorView: NSView {
     var frameIdx = 0
     var spriteW = 120, spriteH = 120
     var ringPct: Double = 0
+    var needsInput = false // shown app waiting on approval -> red border flash
+    var flashOn = false
     var line1 = "5h -"
     var line2 = "Weekly -"
     var showingClaude = true
@@ -202,6 +204,16 @@ final class MirrorView: NSView {
             ]
             ("设备离线" as NSString).draw(in: NSRect(x: 0, y: 60, width: 240, height: 20),
                                           withAttributes: overlay)
+        }
+
+        // approval pending: blink the whole border red over everything else
+        if needsInput && flashOn {
+            let m: CGFloat = 4, t: CGFloat = 10, side: CGFloat = 240 - 2 * m
+            NSColor.systemRed.setFill()
+            NSRect(x: m, y: m, width: side, height: t).fill()
+            NSRect(x: m, y: 240 - m - t, width: side, height: t).fill()
+            NSRect(x: m, y: m, width: t, height: side).fill()
+            NSRect(x: 240 - m - t, y: m, width: t, height: side).fill()
         }
         ctx.restoreGState()
     }
@@ -510,10 +522,12 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
             mirror.ringPct = pct
             mirror.line1 = "5h " + Self.pctText(pct)
             mirror.line2 = "Weekly " + Self.pctText(snap.claude.sevenDayPct)
+            mirror.needsInput = snap.claude.needsInput
         } else {
             mirror.ringPct = snap.codex.primaryPct ?? 0
             mirror.line1 = "5h " + Self.pctText(snap.codex.primaryPct)
             mirror.line2 = "Weekly " + Self.pctText(snap.codex.weeklyPct)
+            mirror.needsInput = snap.codex.needsInput
         }
         mirror.needsDisplay = true
     }
@@ -552,8 +566,25 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
         }
     }
 
+    private var flashCounter = 0
+
     private func animTick() {
-        guard let info = lastInfo, !mirror.netMode, !mirror.frames.isEmpty else { return }
+        guard let info = lastInfo, !mirror.netMode else { return }
+
+        // ~400ms red-border flash while an approval is pending (device cadence)
+        if mirror.needsInput {
+            flashCounter += 1
+            if flashCounter >= 3 { // 3 * 0.12s ≈ 0.36s
+                flashCounter = 0
+                mirror.flashOn.toggle()
+                mirror.needsDisplay = true
+            }
+        } else if mirror.flashOn {
+            mirror.flashOn = false
+            mirror.needsDisplay = true
+        }
+
+        guard !mirror.frames.isEmpty else { return }
         let snap = service.snapshot()
         let working = info.showing == "codex"
             ? snap.codex.status == "working" : snap.claude.status == "working"
@@ -561,8 +592,6 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
             mirror.frameIdx = (mirror.frameIdx + 1) % mirror.frames.count
         } else if mirror.frameIdx != 0 {
             mirror.frameIdx = 0
-        } else {
-            return
         }
         mirror.needsDisplay = true
     }

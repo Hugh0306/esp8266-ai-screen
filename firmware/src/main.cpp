@@ -141,6 +141,7 @@ struct ClaudeStatus {
   int sessionWindowMin = 300;
   float fiveHourPct = -1; // real OAuth quota from the bridge, -1 = unknown
   float sevenDayPct = -1;
+  bool needsInput = false; // waiting on a permission/approval prompt
 };
 
 struct CodexStatus {
@@ -150,6 +151,7 @@ struct CodexStatus {
   int primaryResetMin = -1;
   float weeklyPct = -1;
   int weeklyResetMin = -1;
+  bool needsInput = false;
 };
 
 ClaudeStatus claudeStatus;
@@ -270,12 +272,29 @@ bool bridgeStale() {
   return (millis() - lastSuccessMs) >= 2UL * BRIDGE_POLL_INTERVAL_MS;
 }
 
+// True when the app currently on screen is waiting on a permission/approval
+// prompt — drives the red "look now, act" border flash.
+bool currentAppNeedsInput() {
+  return currentApp == APP_CLAUDE ? claudeStatus.needsInput : codexStatus.needsInput;
+}
+
 // Working vs idle is now conveyed by the sprite animation itself (moving vs
 // still), not by ring color. The ring just stays steady green, except
 // bridge-stale which flashes red ("check it now") and overrides everything.
 uint16_t currentStatusColor() {
   if (bridgeStale()) return flashOn ? TFT_RED : TFT_BLACK;
   return TFT_GREEN;
+}
+
+// Paints the full square border in one color (all four sides), used for the
+// attention flash so the whole edge blinks, not just the filled quota arc.
+void drawFullBorder(uint16_t color) {
+  int x0 = RING_MARGIN, y0 = RING_MARGIN;
+  int side = SCREEN_W - 2 * RING_MARGIN;
+  tft.fillRect(x0, y0, side, RING_THICKNESS, color);                              // top
+  tft.fillRect(x0, SCREEN_H - RING_MARGIN - RING_THICKNESS, side, RING_THICKNESS, color); // bottom
+  tft.fillRect(x0, y0, RING_THICKNESS, side, color);                              // left
+  tft.fillRect(SCREEN_W - RING_MARGIN - RING_THICKNESS, y0, RING_THICKNESS, side, color); // right
 }
 
 // Square progress ring hugging the screen edge. `pct` of the perimeter
@@ -403,6 +422,10 @@ bool updateActiveApp() {
   if (displayMode == MODE_CLAUDE) {
     desired = APP_CLAUDE;
   } else if (displayMode == MODE_CODEX) {
+    desired = APP_CODEX;
+  } else if (claudeStatus.needsInput && !codexStatus.needsInput) {
+    desired = APP_CLAUDE; // approval prompt wins the screen
+  } else if (codexStatus.needsInput && !claudeStatus.needsInput) {
     desired = APP_CODEX;
   } else {
     bool claudeWorking = claudeStatus.status == "working";
@@ -839,6 +862,7 @@ bool parseStatusJson(const String &payload) {
     claudeStatus.sessionWindowMin = c["session_window_min"] | 300;
     claudeStatus.fiveHourPct = c["five_hour_pct"] | -1.0;
     claudeStatus.sevenDayPct = c["seven_day_pct"] | -1.0;
+    claudeStatus.needsInput = c["needs_input"] | false;
   }
 
   JsonObject x = doc["codex"];
@@ -849,14 +873,20 @@ bool parseStatusJson(const String &payload) {
     codexStatus.primaryResetMin = x["primary_reset_min"] | -1;
     codexStatus.weeklyPct = x["weekly_pct"] | -1.0;
     codexStatus.weeklyResetMin = x["weekly_reset_min"] | -1;
+    codexStatus.needsInput = x["needs_input"] | false;
   }
   statusMusicPlaying = doc["music_playing"] | false;
   return true;
 }
 
-// The mode actually rendered: AUTO promotes to music while audio is playing.
+// The mode actually rendered. In AUTO: a pending approval prompt wins (stay on
+// the pet so its border can flash red at you), otherwise audio promotes to the
+// music page.
 DisplayMode effectiveMode() {
-  if (displayMode == MODE_AUTO && statusMusicPlaying) return MODE_MUSIC;
+  if (displayMode == MODE_AUTO) {
+    if (claudeStatus.needsInput || codexStatus.needsInput) return MODE_AUTO;
+    if (statusMusicPlaying) return MODE_MUSIC;
+  }
   return displayMode;
 }
 
@@ -1437,7 +1467,14 @@ void loop() {
     if (nowMs - lastFlashMs >= FLASH_INTERVAL_MS) {
       lastFlashMs = nowMs;
       flashOn = !flashOn;
-      if (bridgeStale()) redrawRingOnly();
+      if (bridgeStale()) {
+        redrawRingOnly();
+      } else if (currentAppNeedsInput()) {
+        // approval needed: blink the whole border red, restore the quota ring
+        // on the off-phase so it doesn't erase the normal chrome permanently
+        if (flashOn) drawFullBorder(TFT_RED);
+        else redrawRingOnly();
+      }
     }
 
     // alternate which app is shown when neither/both are uniquely working
