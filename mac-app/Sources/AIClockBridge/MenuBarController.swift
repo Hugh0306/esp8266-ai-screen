@@ -16,7 +16,6 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private let codexUsageItem = NSMenuItem(title: "Codex …", action: nil, keyEquivalent: "")
     private let deviceInfoItem = NSMenuItem(title: "设备：未设置", action: nil, keyEquivalent: "")
     private var modeItems: [String: NSMenuItem] = [:]
-    private var flashItem: NSMenuItem?
 
     init(service: StatusService, usage: UsageFetcher, netMonitor: NetSpeedMonitor,
          nowPlaying: NowPlayingMonitor, port: UInt16) {
@@ -107,8 +106,6 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         menu.addItem(resetItem)
 
         menu.addItem(makeItem("把本机设为设备桥接", #selector(pointBridgeHere)))
-        flashItem = makeItem("刷写固件（USB）…", #selector(flashFirmware))
-        menu.addItem(flashItem!)
         menu.addItem(.separator())
         menu.addItem(makeItem("刷新", #selector(refreshAction), key: "r"))
         menu.addItem(makeItem("桥接服务地址", #selector(showAddress)))
@@ -195,7 +192,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         }
     }
 
-    // MARK: - pairing / flashing
+    // MARK: - pairing
 
     @objc private func autoPairAction() {
         deviceInfoItem.title = "设备：正在查找…"
@@ -214,34 +211,6 @@ final class MenuBarController: NSObject, NSMenuDelegate {
                 self?.refreshDeviceSection()
             }
         })
-    }
-
-    @objc private func flashFirmware() {
-        guard !FlashService.isRunning else { return }
-        let alert = NSAlert()
-        alert.messageText = "刷写固件"
-        let port = FlashService.findSerialPort()
-        alert.informativeText = port.map {
-            "将编译当前固件代码并通过 \($0) 烧录到时钟（约 1 分钟，期间屏幕会黑屏重启）。"
-        } ?? "未检测到 USB 串口。请先用数据线把时钟连到 Mac。"
-        alert.addButton(withTitle: port != nil ? "开始刷写" : "好")
-        if port != nil { alert.addButton(withTitle: "取消") }
-        NSApp.activate(ignoringOtherApps: true)
-        guard port != nil, alert.runModal() == .alertFirstButtonReturn else { return }
-
-        flashItem?.title = "正在刷写固件…"
-        flashItem?.isEnabled = false
-        FlashService.flash { [weak self] result in
-            self?.flashItem?.title = "刷写固件（USB）…"
-            self?.flashItem?.isEnabled = true
-            switch result {
-            case let .success(usedPort):
-                Self.toast("刷写成功", "固件已通过 \(usedPort) 烧录完成，设备正在重启。")
-                self?.refreshDeviceSection()
-            case let .failure(error):
-                Self.toast("刷写失败", error.message)
-            }
-        }
     }
 
     // MARK: - actions
