@@ -131,7 +131,8 @@ unsigned long lastAnimMs = 0;
 bool flashOn = true;
 unsigned long lastFlashMs = 0;
 
-WiFiManagerParameter bridgeHostParam("bridge", "Bridge host (ip:port)", "", 40);
+// Bridge host is not asked for during first-time WiFi setup: the Mac/Windows
+// bridge discovers the device and pairs automatically (or set via /api/bridge).
 String bridgeHost;
 
 struct ClaudeStatus {
@@ -827,8 +828,6 @@ void configModeCallback(WiFiManager *wm) {
 void setupWiFi() {
   WiFiManager wm;
   wm.setAPCallback(configModeCallback);
-  bridgeHostParam.setValue(bridgeHost.c_str(), 40);
-  wm.addParameter(&bridgeHostParam);
 
   tft.fillScreen(TFT_BLACK);
   tft.setTextDatum(TL_DATUM);
@@ -839,13 +838,6 @@ void setupWiFi() {
   bool ok = wm.autoConnect(WIFI_PORTAL_AP_NAME);
   Serial.printf("[wifi] autoConnect result=%d ssid=%s ip=%s\n", ok, WiFi.SSID().c_str(),
                 WiFi.localIP().toString().c_str());
-
-  String newHost = bridgeHostParam.getValue();
-  newHost.trim();
-  if (newHost.length() > 0 && newHost != bridgeHost) {
-    bridgeHost = newHost;
-    saveBridgeHost(bridgeHost);
-  }
   Serial.printf("[wifi] bridge host = '%s'\n", bridgeHost.c_str());
 }
 
