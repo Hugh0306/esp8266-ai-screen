@@ -823,6 +823,8 @@ void configModeCallback(WiFiManager *wm) {
   tft.drawString(WIFI_PORTAL_AP_NAME, 8, 95, 2);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.drawString("then open 192.168.4.1", 8, 125, 2);
+  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  tft.drawString("Firmware v" FW_VERSION, 8, 215, 2);
 }
 
 void setupWiFi() {
@@ -1022,6 +1024,7 @@ void handleApiInfo() {
   doc["showing"] = (currentApp == APP_CLAUDE) ? "claude" : "codex";
   doc["last_update_s"] = everPolled ? (long)((millis() - lastSuccessMs) / 1000) : -1;
   doc["sprite_rev"] = spriteRev;
+  doc["fw"] = FW_VERSION;
   JsonObject c = doc["claude"].to<JsonObject>();
   c["status"] = claudeStatus.status;
   c["custom_sprite"] = claudeCustom;
