@@ -105,6 +105,12 @@ swift run AIClockBridge --render-weather-themes <OUTPUT_DIR>
 
 生成结果只用于本地检查。提交图片前应确认其中没有账号、网络或设备信息。
 
+行情分享图使用内置演示数据，不请求网络或连接设备：
+
+```bash
+swift run AIClockBridge --render-stock-preview <OUTPUT_FILE>
+```
+
 ## Windows 预览版
 
 Windows 目录可以用 .NET 8 SDK 构建：

@@ -2,6 +2,28 @@ import AppKit
 
 // Entry point. Runs as an "accessory" app (menu-bar only, no Dock icon, no main
 // window) and starts the /status HTTP server that the ESP8266 clock polls.
+if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--render-stock-preview" {
+    let outputURL = URL(fileURLWithPath: CommandLine.arguments[2])
+    let view = MirrorView(frame: NSRect(x: 0, y: 0, width: 240, height: 240))
+    view.stockMode = true
+    view.stockRows = [
+        StockMonitor.Row(symbol: "usQQQ", code: "QQQ", name: "Nasdaq 100",
+                         price: "618.24", pct: "+0.54%", up: 1),
+        StockMonitor.Row(code: "BTCUSDT", name: "BTC / USDT",
+                         price: "118240.0", pct: "+1.24%", up: 1),
+        StockMonitor.Row(code: "ETHUSDT", name: "ETH / USDT",
+                         price: "3548.20", pct: "-0.68%", up: -1),
+        StockMonitor.Row(code: "ETHBTC", name: "ETH / BTC",
+                         price: "0.03001", pct: "+0.31%", up: 1),
+    ]
+    guard let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { exit(1) }
+    view.cacheDisplay(in: view.bounds, to: bitmap)
+    guard let png = bitmap.representation(using: .png, properties: [:]) else { exit(1) }
+    try png.write(to: outputURL)
+    print("stock preview render: ok")
+    exit(0)
+}
+
 if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--render-weather-themes" {
     let outputDirectory = URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true)
     try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
