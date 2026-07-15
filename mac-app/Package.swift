@@ -12,7 +12,7 @@ let package = Package(
         .executableTarget(
             name: "AIClockBridge",
             path: "Sources/AIClockBridge",
-            resources: [.process("Resources")]
+            exclude: ["Resources"]
         ),
         .testTarget(
             name: "AIClockBridgeTests",

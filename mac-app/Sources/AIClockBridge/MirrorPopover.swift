@@ -9,6 +9,18 @@ import AppKit
 // Result: what you see here is what the panel shows, including the walk
 // cycle animating only while that app is "working".
 
+struct CodexQuotaDisplay {
+    let ringPct: Double
+    let weeklyOnly: Bool
+}
+
+func codexQuotaDisplay(primaryPct: Double?, weeklyPct: Double?) -> CodexQuotaDisplay {
+    CodexQuotaDisplay(
+        ringPct: primaryPct ?? weeklyPct ?? 0,
+        weeklyOnly: primaryPct == nil && weeklyPct != nil
+    )
+}
+
 // MARK: - RGB565 frame decoding
 
 private func decodeSpriteFrames(_ data: Data, w: Int, h: Int) -> [CGImage] {
@@ -40,28 +52,6 @@ private func decodeSpriteFrames(_ data: Data, w: Int, h: Int) -> [CGImage] {
         }
     }
     return frames
-}
-
-private func decodeCover(_ data: Data, w: Int, h: Int) -> CGImage? {
-    let frameBytes = w * h * 2
-    guard data.count >= frameBytes else { return nil }
-    let bytes = [UInt8](data)
-    var rgba = [UInt8](repeating: 255, count: w * h * 4)
-    var src = 0
-    for p in 0..<(w * h) {
-        let v = (UInt16(bytes[src]) << 8) | UInt16(bytes[src + 1])
-        src += 2
-        rgba[p * 4 + 0] = UInt8((v >> 11) & 0x1F) << 3
-        rgba[p * 4 + 1] = UInt8((v >> 5) & 0x3F) << 2
-        rgba[p * 4 + 2] = UInt8(v & 0x1F) << 3
-    }
-    let data = CFDataCreate(nil, rgba, rgba.count)!
-    guard let provider = CGDataProvider(data: data) else { return nil }
-    return CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32,
-                   bytesPerRow: w * 4, space: CGColorSpaceCreateDeviceRGB(),
-                   bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
-                   provider: provider, decode: nil, shouldInterpolate: false,
-                   intent: .defaultIntent)
 }
 
 // MARK: - the 240x240 replica view
@@ -110,16 +100,19 @@ final class MirrorView: NSView {
         max(maxV * 1.15, 10240)
     }
 
-    var musicMode = false
-    var musicTitle = ""
-    var musicArtist = ""
-    var musicElapsed: Double = 0
-    var musicDuration: Double = 0
-    var musicPlaying = false
-    var musicCover: CGImage?
+    var weatherMode = false
+    var weather = WeatherMonitor.Snapshot()
+    var weatherTheme = "classic"
 
-    private static let claudeLogo = Bundle.module.image(forResource: "claude-logo")
-    private static let codexLogo = Bundle.module.image(forResource: "codex-logo")
+    private static func appImage(_ name: String) -> NSImage? {
+        if let image = Bundle.main.image(forResource: name) { return image }
+        let source = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .appendingPathComponent("Resources/\(name).png")
+        return NSImage(contentsOf: source)
+    }
+
+    private static let claudeLogo = appImage("claude-logo")
+    private static let codexLogo = appImage("codex-logo")
 
     override var isFlipped: Bool { true } // draw in the panel's top-left origin
 
@@ -141,8 +134,8 @@ final class MirrorView: NSView {
             ctx.restoreGState()
             return
         }
-        if musicMode {
-            drawMusicScene(ctx)
+        if weatherMode {
+            drawWeatherScene(ctx)
             ctx.restoreGState()
             return
         }
@@ -225,49 +218,234 @@ final class MirrorView: NSView {
         ctx.restoreGState()
     }
 
-    private func drawMusicScene(_ ctx: CGContext) {
-        let coverRect = CGRect(x: 56, y: 16, width: 128, height: 128)
-        if let musicCover {
-            ctx.saveGState()
-            ctx.interpolationQuality = .none
-            ctx.translateBy(x: 0, y: coverRect.midY)
-            ctx.scaleBy(x: 1, y: -1)
-            ctx.translateBy(x: 0, y: -coverRect.midY)
-            ctx.draw(musicCover, in: coverRect)
-            ctx.restoreGState()
-        } else {
-            ctx.setFillColor(NSColor.darkGray.cgColor)
-            ctx.fill(coverRect)
-            let style = NSMutableParagraphStyle()
-            style.alignment = .center
-            ("No Art" as NSString).draw(in: NSRect(x: 56, y: 72, width: 128, height: 20), withAttributes: [
-                .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .semibold),
-                .foregroundColor: NSColor.lightGray,
-                .paragraphStyle: style,
-            ])
+    private func drawWeatherScene(_ ctx: CGContext) {
+        let calendar = Calendar(identifier: .gregorian)
+        var localCalendar = calendar
+        localCalendar.timeZone = TimeZone(identifier: "Asia/Shanghai") ?? .current
+        let now = Date()
+        let parts = localCalendar.dateComponents([.hour, .minute, .second], from: now)
+        let hour = parts.hour ?? 0, minute = parts.minute ?? 0, second = parts.second ?? 0
+        let time = String(format: "%02d:%02d", hour, minute)
+        let seconds = String(format: "%02d", second)
+        let dateFormatter = DateFormatter()
+        dateFormatter.locale = Locale(identifier: "en_US_POSIX")
+        dateFormatter.timeZone = localCalendar.timeZone
+        dateFormatter.dateFormat = "MM/dd"
+        let date = dateFormatter.string(from: now).uppercased()
+        dateFormatter.dateFormat = "EEE"
+        let weekday = dateFormatter.string(from: now).uppercased()
+
+        switch weatherTheme {
+        case "minimal":
+            drawHarborDial(ctx, hour: hour, minute: minute, second: second,
+                           date: date, weekday: weekday)
+        case "dashboard":
+            drawMeteoGrid(ctx, time: time, seconds: seconds, date: date, weekday: weekday)
+        default:
+            drawHarborDigital(ctx, time: time, seconds: seconds, second: second,
+                              date: date, weekday: weekday)
         }
+        drawWeatherFooter(ctx)
+    }
 
-        let titleStyle = NSMutableParagraphStyle()
-        titleStyle.alignment = .center
-        titleStyle.lineBreakMode = .byTruncatingTail
-        let title = musicTitle.isEmpty ? "No Music" : musicTitle
-        (title as NSString).draw(in: NSRect(x: 12, y: 154, width: 216, height: 24), withAttributes: [
-            .font: NSFont.systemFont(ofSize: 15, weight: .bold),
-            .foregroundColor: NSColor.white,
-            .paragraphStyle: titleStyle,
-        ])
-        (musicArtist as NSString).draw(in: NSRect(x: 12, y: 178, width: 216, height: 20), withAttributes: [
-            .font: NSFont.systemFont(ofSize: 12, weight: .regular),
-            .foregroundColor: NSColor.lightGray,
-            .paragraphStyle: titleStyle,
-        ])
+    private var weatherTemperature: String {
+        weather.available ? String(format: "%.0f°C", weather.temperatureC) : "--°C"
+    }
 
-        let bar = CGRect(x: 20, y: 210, width: 200, height: 8)
-        ctx.setFillColor(NSColor.darkGray.cgColor)
-        ctx.fill(bar)
-        let frac = musicDuration > 0 ? max(0, min(1, musicElapsed / musicDuration)) : 0
-        ctx.setFillColor((musicPlaying ? NSColor.systemGreen : NSColor.gray).cgColor)
-        ctx.fill(CGRect(x: bar.minX, y: bar.minY, width: bar.width * frac, height: bar.height))
+    private var weatherRange: String {
+        weather.available ? String(format: "%.0f/%.0f", weather.highC, weather.lowC) : "--/--"
+    }
+
+    private var weatherAQI: String { weather.aqi >= 0 ? String(weather.aqi) : "--" }
+
+    private var weatherIconKind: WeatherIconKind {
+        switch weather.skycon {
+        case "CLEAR_DAY": return .clearDay
+        case "CLEAR_NIGHT": return .clearNight
+        case "PARTLY_CLOUDY_DAY": return .partlyDay
+        case "PARTLY_CLOUDY_NIGHT": return .partlyNight
+        case "CLOUDY": return .cloudy
+        case "LIGHT_RAIN": return .lightRain
+        case "MODERATE_RAIN": return .moderateRain
+        case "HEAVY_RAIN": return .heavyRain
+        case "STORM_RAIN": return .stormRain
+        case "LIGHT_SNOW": return .lightSnow
+        case "MODERATE_SNOW": return .moderateSnow
+        case "HEAVY_SNOW", "STORM_SNOW": return .heavySnow
+        case "FOG": return .fog
+        case let value where value.contains("HAZE"): return .haze
+        case "DUST", "SAND": return .dust
+        case "WIND": return .wind
+        default: return .unknown
+        }
+    }
+
+    private func drawText(_ text: String, rect: NSRect, font: NSFont, color: NSColor,
+                          alignment: NSTextAlignment = .left) {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = alignment
+        paragraph.lineBreakMode = .byClipping
+        (text as NSString).draw(in: rect, withAttributes: [
+            .font: font, .foregroundColor: color, .paragraphStyle: paragraph,
+        ])
+    }
+
+    private func drawWeatherFooter(_ ctx: CGContext) {
+        ctx.setFillColor(NSColor.black.cgColor)
+        ctx.fill(CGRect(x: 0, y: 206, width: 240, height: 34))
+        drawText(weather.lunarZh, rect: NSRect(x: 4, y: 209, width: 232, height: 25),
+                 font: .systemFont(ofSize: 15, weight: .semibold), color: .white, alignment: .center)
+    }
+
+    private func drawStaleDot(_ ctx: CGContext, background: NSColor, x: CGFloat, y: CGFloat) {
+        ctx.setFillColor((weather.stale ? NSColor.systemOrange : background).cgColor)
+        ctx.fillEllipse(in: CGRect(x: x, y: y, width: 6, height: 6))
+    }
+
+    private func drawMetric(_ label: String, value: String, centerX: CGFloat, labelY: CGFloat,
+                            valueY: CGFloat, labelColor: NSColor, valueColor: NSColor) {
+        drawText(label, rect: NSRect(x: centerX - 38, y: labelY, width: 76, height: 17),
+                 font: .systemFont(ofSize: 12, weight: .semibold), color: labelColor, alignment: .center)
+        let valueSize: CGFloat = value.count > 5 ? 16 : 20
+        drawText(value, rect: NSRect(x: centerX - 38, y: valueY, width: 76, height: 27),
+                 font: .monospacedDigitSystemFont(ofSize: valueSize, weight: .semibold),
+                 color: valueColor, alignment: .center)
+    }
+
+    private func drawWeatherIcon(_ ctx: CGContext, x: Int, y: Int, color: NSColor) {
+        ctx.setFillColor(color.cgColor)
+        for row in 0..<WeatherIconData.height {
+            var column = 0
+            while column < WeatherIconData.width {
+                while column < WeatherIconData.width,
+                      !WeatherIconData.isSet(weatherIconKind, x: column, y: row) {
+                    column += 1
+                }
+                let start = column
+                while column < WeatherIconData.width,
+                      WeatherIconData.isSet(weatherIconKind, x: column, y: row) {
+                    column += 1
+                }
+                if column > start {
+                    ctx.fill(CGRect(x: CGFloat(x + start), y: CGFloat(y + row),
+                                    width: CGFloat(column - start), height: 1))
+                }
+            }
+        }
+    }
+
+    private func drawHarborDigital(_ ctx: CGContext, time: String, seconds: String,
+                                   second: Int, date: String, weekday: String) {
+        let background = NSColor(calibratedRed: 7/255, green: 19/255, blue: 21/255, alpha: 1)
+        let text = NSColor(calibratedRed: 239/255, green: 244/255, blue: 240/255, alpha: 1)
+        let muted = NSColor(calibratedRed: 126/255, green: 151/255, blue: 146/255, alpha: 1)
+        let teal = NSColor(calibratedRed: 73/255, green: 216/255, blue: 210/255, alpha: 1)
+        let coral = NSColor(calibratedRed: 255/255, green: 107/255, blue: 87/255, alpha: 1)
+        let amber = NSColor(calibratedRed: 244/255, green: 200/255, blue: 90/255, alpha: 1)
+        ctx.setFillColor(background.cgColor); ctx.fill(CGRect(x: 0, y: 0, width: 240, height: 206))
+        drawText(WeatherMonitor.displayLabel, rect: NSRect(x: 8, y: 8, width: 90, height: 18),
+                 font: .monospacedSystemFont(ofSize: 12, weight: .semibold), color: teal)
+        drawText(weekday, rect: NSRect(x: 118, y: 8, width: 42, height: 18),
+                 font: .monospacedSystemFont(ofSize: 12, weight: .medium),
+                 color: muted, alignment: .right)
+        drawText(date, rect: NSRect(x: 164, y: 4, width: 68, height: 28),
+                 font: .monospacedDigitSystemFont(ofSize: 20, weight: .semibold),
+                 color: text, alignment: .right)
+        drawText(time, rect: NSRect(x: 8, y: 31, width: 172, height: 55),
+                 font: .monospacedDigitSystemFont(ofSize: 47, weight: .medium), color: text)
+        drawText(seconds, rect: NSRect(x: 174, y: 37, width: 50, height: 40),
+                 font: .monospacedDigitSystemFont(ofSize: 31, weight: .semibold), color: coral, alignment: .right)
+        ctx.setFillColor(NSColor(calibratedRed: 24/255, green: 48/255, blue: 47/255, alpha: 1).cgColor)
+        ctx.fill(CGRect(x: 8, y: 86, width: 224, height: 4))
+        ctx.setFillColor(teal.cgColor); ctx.fill(CGRect(x: 8, y: 86, width: CGFloat(second + 1) * 224 / 60, height: 4))
+        drawText(weatherTemperature, rect: NSRect(x: 8, y: 99, width: 140, height: 55),
+                 font: .monospacedDigitSystemFont(ofSize: 45, weight: .medium), color: amber)
+        drawWeatherIcon(ctx, x: 178, y: 104, color: teal)
+        drawMetric("H/L", value: weatherRange, centerX: 42, labelY: 164, valueY: 180, labelColor: muted, valueColor: text)
+        drawMetric("HUM", value: weather.available ? "\(weather.humidityPct)%" : "--", centerX: 120,
+                   labelY: 164, valueY: 180, labelColor: muted, valueColor: text)
+        drawMetric("AQI", value: weatherAQI, centerX: 198, labelY: 164, valueY: 180, labelColor: muted, valueColor: text)
+        drawStaleDot(ctx, background: background, x: 103, y: 5)
+    }
+
+    private func drawHarborDial(_ ctx: CGContext, hour: Int, minute: Int, second: Int,
+                                date: String, weekday: String) {
+        let background = NSColor(calibratedRed: 16/255, green: 17/255, blue: 16/255, alpha: 1)
+        let cream = NSColor(calibratedRed: 238/255, green: 231/255, blue: 214/255, alpha: 1)
+        let muted = NSColor(calibratedRed: 126/255, green: 151/255, blue: 146/255, alpha: 1)
+        let teal = NSColor(calibratedRed: 73/255, green: 216/255, blue: 210/255, alpha: 1)
+        let coral = NSColor(calibratedRed: 255/255, green: 107/255, blue: 87/255, alpha: 1)
+        let amber = NSColor(calibratedRed: 244/255, green: 200/255, blue: 90/255, alpha: 1)
+        ctx.setFillColor(background.cgColor); ctx.fill(CGRect(x: 0, y: 0, width: 240, height: 206))
+        let center = CGPoint(x: 120, y: 85)
+        ctx.setStrokeColor(NSColor(calibratedRed: 63/255, green: 72/255, blue: 68/255, alpha: 1).cgColor)
+        ctx.setLineWidth(1); ctx.strokeEllipse(in: CGRect(x: 57, y: 22, width: 126, height: 126))
+        for index in stride(from: 0, to: 60, by: 5) {
+            let angle = CGFloat(index) * .pi / 30 - .pi / 2
+            let inner: CGFloat = index % 15 == 0 ? 51 : 55
+            ctx.setStrokeColor((index % 15 == 0 ? teal : muted).cgColor)
+            ctx.move(to: CGPoint(x: center.x + cos(angle) * inner, y: center.y + sin(angle) * inner))
+            ctx.addLine(to: CGPoint(x: center.x + cos(angle) * 62, y: center.y + sin(angle) * 62))
+            ctx.strokePath()
+        }
+        func hand(_ index: CGFloat, length: CGFloat, width: CGFloat, color: NSColor, tail: CGFloat = 0) {
+            let angle = index * .pi / 30 - .pi / 2
+            ctx.setStrokeColor(color.cgColor); ctx.setLineWidth(width); ctx.setLineCap(.round)
+            ctx.move(to: CGPoint(x: center.x - cos(angle) * tail, y: center.y - sin(angle) * tail))
+            ctx.addLine(to: CGPoint(x: center.x + cos(angle) * length, y: center.y + sin(angle) * length))
+            ctx.strokePath()
+        }
+        hand(CGFloat((hour % 12) * 5) + CGFloat(minute) / 12, length: 32, width: 5, color: cream)
+        hand(CGFloat(minute), length: 46, width: 3, color: teal)
+        hand(CGFloat(second), length: 54, width: 1.5, color: coral, tail: 10)
+        ctx.setFillColor(cream.cgColor); ctx.fillEllipse(in: CGRect(x: 116, y: 81, width: 8, height: 8))
+        ctx.setFillColor(coral.cgColor); ctx.fillEllipse(in: CGRect(x: 118, y: 83, width: 4, height: 4))
+        drawText(WeatherMonitor.displayLabel, rect: NSRect(x: 8, y: 8, width: 90, height: 18),
+                 font: .monospacedSystemFont(ofSize: 12, weight: .semibold), color: teal)
+        drawText(weekday, rect: NSRect(x: 118, y: 8, width: 42, height: 18),
+                 font: .monospacedSystemFont(ofSize: 12, weight: .medium),
+                 color: muted, alignment: .right)
+        drawText(date, rect: NSRect(x: 164, y: 4, width: 68, height: 28),
+                 font: .monospacedDigitSystemFont(ofSize: 20, weight: .semibold),
+                 color: cream, alignment: .right)
+        drawText(weatherTemperature, rect: NSRect(x: 8, y: 151, width: 115, height: 48),
+                 font: .monospacedDigitSystemFont(ofSize: 39, weight: .medium), color: amber)
+        drawWeatherIcon(ctx, x: 178, y: 154, color: teal)
+        drawStaleDot(ctx, background: background, x: 103, y: 5)
+    }
+
+    private func drawMeteoGrid(_ ctx: CGContext, time: String, seconds: String,
+                               date: String, weekday: String) {
+        let background = NSColor(calibratedRed: 231/255, green: 236/255, blue: 232/255, alpha: 1)
+        let text = NSColor(calibratedRed: 16/255, green: 32/255, blue: 28/255, alpha: 1)
+        let muted = NSColor(calibratedRed: 97/255, green: 115/255, blue: 109/255, alpha: 1)
+        let green = NSColor(calibratedRed: 8/255, green: 126/255, blue: 104/255, alpha: 1)
+        let coral = NSColor(calibratedRed: 215/255, green: 91/255, blue: 63/255, alpha: 1)
+        ctx.setFillColor(background.cgColor); ctx.fill(CGRect(x: 0, y: 0, width: 240, height: 206))
+        drawText(time, rect: NSRect(x: 8, y: 5, width: 184, height: 58),
+                 font: .monospacedDigitSystemFont(ofSize: 43, weight: .medium), color: text)
+        drawText(seconds, rect: NSRect(x: 174, y: 16, width: 50, height: 40),
+                 font: .monospacedDigitSystemFont(ofSize: 31, weight: .semibold), color: coral, alignment: .right)
+        drawText(WeatherMonitor.displayLabel, rect: NSRect(x: 8, y: 65, width: 100, height: 18),
+                 font: .monospacedSystemFont(ofSize: 12, weight: .semibold), color: green)
+        drawText(weekday, rect: NSRect(x: 118, y: 65, width: 42, height: 18),
+                 font: .monospacedSystemFont(ofSize: 12, weight: .medium),
+                 color: muted, alignment: .right)
+        drawText(date, rect: NSRect(x: 164, y: 61, width: 68, height: 28),
+                 font: .monospacedDigitSystemFont(ofSize: 20, weight: .semibold),
+                 color: text, alignment: .right)
+        ctx.setFillColor(NSColor(calibratedRed: 178/255, green: 190/255, blue: 183/255, alpha: 1).cgColor)
+        ctx.fill(CGRect(x: 8, y: 90, width: 224, height: 1))
+        drawText(weatherTemperature, rect: NSRect(x: 8, y: 94, width: 140, height: 56),
+                 font: .monospacedDigitSystemFont(ofSize: 45, weight: .medium), color: green)
+        drawWeatherIcon(ctx, x: 178, y: 101, color: green)
+        ctx.setFillColor(NSColor(calibratedRed: 190/255, green: 200/255, blue: 194/255, alpha: 1).cgColor)
+        ctx.fill(CGRect(x: 80, y: 159, width: 1, height: 43)); ctx.fill(CGRect(x: 160, y: 159, width: 1, height: 43))
+        drawMetric("H/L", value: weatherRange, centerX: 40, labelY: 160, valueY: 177, labelColor: muted, valueColor: text)
+        drawMetric("HUM", value: weather.available ? "\(weather.humidityPct)%" : "--", centerX: 120,
+                   labelY: 160, valueY: 177, labelColor: muted, valueColor: text)
+        drawMetric("AQI", value: weatherAQI, centerX: 200, labelY: 160, valueY: 177, labelColor: muted, valueColor: text)
+        drawStaleDot(ctx, background: background, x: 229, y: 5)
     }
 
     /// Replica of the firmware's net-speed screen v2: header readouts, then
@@ -388,7 +566,7 @@ final class MirrorView: NSView {
         if stockRows.isEmpty {
             let style = NSMutableParagraphStyle()
             style.alignment = .center
-            ("未配置自选股\n右键菜单 → 设置自选股…" as NSString).draw(
+            ("未配置行情\n右键菜单 → 设置行情品种…" as NSString).draw(
                 in: NSRect(x: 0, y: 104, width: 240, height: 40), withAttributes: [
                     .font: NSFont.systemFont(ofSize: 11), .foregroundColor: grey,
                     .paragraphStyle: style,
@@ -404,9 +582,15 @@ final class MirrorView: NSView {
             (row.price as NSString).draw(at: NSPoint(x: 14, y: y0 + 15), withAttributes: [
                 .font: valueFont, .foregroundColor: NSColor.white,
             ])
-            let pctColor = row.up > 0 ? NSColor(calibratedRed: 1, green: 0.23, blue: 0.19, alpha: 1)
-                : (row.up < 0 ? NSColor(calibratedRed: 0, green: 0.85, blue: 0.2, alpha: 1)
-                              : NSColor.lightGray)
+            let pctColor: NSColor
+            switch marketColorRole(up: row.up) {
+            case .gain:
+                pctColor = NSColor(calibratedRed: 0, green: 0.85, blue: 0.2, alpha: 1)
+            case .loss:
+                pctColor = NSColor(calibratedRed: 1, green: 0.23, blue: 0.19, alpha: 1)
+            case .neutral:
+                pctColor = .lightGray
+            }
             let style = NSMutableParagraphStyle()
             style.alignment = .right
             (row.pct as NSString).draw(
@@ -436,11 +620,11 @@ final class MirrorView: NSView {
 final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     private let service: StatusService
     private let netMonitor: NetSpeedMonitor
-    private let nowPlaying: NowPlayingMonitor
     private let stockMonitor: StockMonitor
+    private let weatherMonitor: WeatherMonitor
     private let popover = NSPopover()
     private let mirror = MirrorView()
-    private let modeControl = NSSegmentedControl(labels: ["自动", "Claude", "Codex", "网速", "音乐", "股票"],
+    private let modeControl = NSSegmentedControl(labels: ["自动", "Claude", "Codex", "网速", "天气", "股票"],
                                                  trackingMode: .selectOne, target: nil, action: nil)
     private let statusLabel = NSTextField(labelWithString: "连接设备中…")
     private let brightnessSlider = NSSlider(value: 100, minValue: 0, maxValue: 100,
@@ -458,12 +642,12 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     private var lastInfo: DeviceInfo?
     private var fetchingSlot: String?
 
-    init(service: StatusService, netMonitor: NetSpeedMonitor, nowPlaying: NowPlayingMonitor,
-         stockMonitor: StockMonitor) {
+    init(service: StatusService, netMonitor: NetSpeedMonitor, stockMonitor: StockMonitor,
+         weatherMonitor: WeatherMonitor) {
         self.service = service
         self.netMonitor = netMonitor
-        self.nowPlaying = nowPlaying
         self.stockMonitor = stockMonitor
+        self.weatherMonitor = weatherMonitor
         super.init()
         popover.behavior = .transient
         popover.delegate = self
@@ -594,14 +778,17 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
                 self.lastInfo = info
                 self.mirror.deviceOK = true
                 self.applyScene(info)
-                self.ensureSprite(info)
+                if !["net", "weather", "music", "stock"].contains(info.effective) {
+                    self.ensureSprite(info)
+                }
                 self.syncBrightness(info)
                 let modeIdx = ["auto": 0, "claude": 1, "codex": 2, "net": 3,
-                               "music": 4, "stock": 5][info.mode] ?? 0
+                               "weather": 4, "music": 4, "stock": 5][info.mode] ?? 0
                 self.modeControl.selectedSegment = modeIdx
                 let modeText = info.mode == "auto" ? "自动切换"
                     : info.mode == "net" ? "网速曲线"
-                    : info.mode == "music" ? "音乐播放" : "固定显示"
+                    : (info.mode == "weather" || info.mode == "music") ? "天气时钟"
+                    : info.mode == "stock" ? "股票行情" : "固定显示"
                 self.statusLabel.stringValue = "\(info.ip) · \(modeText) · 数据 \(info.bridge)"
             case .failure:
                 self.mirror.deviceOK = false
@@ -623,11 +810,11 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
 
     /// Quota lines & ring exactly as the firmware computes them from /status.
     private func applyScene(_ info: DeviceInfo) {
-        // mirror what's actually on the device screen (effective), so an
-        // AUTO device that auto-switched to music shows music here too
+        // Treat the retired music mode as weather while old firmware is still
+        // reporting it during the transition.
         let enteringNet = info.effective == "net" && !mirror.netMode
         mirror.netMode = info.effective == "net"
-        mirror.musicMode = info.effective == "music"
+        mirror.weatherMode = info.effective == "weather" || info.effective == "music"
         mirror.stockMode = info.effective == "stock"
         if mirror.stockMode {
             mirror.stockRows = stockMonitor.snapshot
@@ -639,14 +826,9 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
             mirror.needsDisplay = true
             return
         }
-        if mirror.musicMode {
-            let s = nowPlaying.snapshot
-            mirror.musicTitle = s.title
-            mirror.musicArtist = s.artist
-            mirror.musicElapsed = s.elapsed
-            mirror.musicDuration = s.duration
-            mirror.musicPlaying = s.playing
-            mirror.musicCover = decodeCover(nowPlaying.coverRGB565, w: 128, h: 128)
+        if mirror.weatherMode {
+            mirror.weather = weatherMonitor.snapshot
+            mirror.weatherTheme = info.clockTheme
             mirror.needsDisplay = true
             return
         }
@@ -661,9 +843,16 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
             mirror.line2 = "Weekly " + Self.pctText(snap.claude.sevenDayPct)
             mirror.needsInput = snap.claude.needsInput
         } else {
-            mirror.ringPct = snap.codex.primaryPct ?? 0
-            mirror.line1 = "5h " + Self.pctText(snap.codex.primaryPct)
-            mirror.line2 = "Weekly " + Self.pctText(snap.codex.weeklyPct)
+            let quota = codexQuotaDisplay(primaryPct: snap.codex.primaryPct,
+                                          weeklyPct: snap.codex.weeklyPct)
+            mirror.ringPct = quota.ringPct
+            if quota.weeklyOnly {
+                mirror.line1 = "Weekly " + Self.pctText(snap.codex.weeklyPct)
+                mirror.line2 = ""
+            } else {
+                mirror.line1 = "5h " + Self.pctText(snap.codex.primaryPct)
+                mirror.line2 = "Weekly " + Self.pctText(snap.codex.weeklyPct)
+            }
             mirror.needsInput = snap.codex.needsInput
         }
         mirror.needsDisplay = true
@@ -706,7 +895,7 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     private var flashCounter = 0
 
     private func animTick() {
-        guard let info = lastInfo, !mirror.netMode else { return }
+        guard let info = lastInfo, !mirror.netMode, !mirror.weatherMode, !mirror.stockMode else { return }
 
         // ~400ms red-border flash while an approval is pending (device cadence)
         if mirror.needsInput {
@@ -734,7 +923,7 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     }
 
     @objc private func modeChanged() {
-        let mode = ["auto", "claude", "codex", "net", "music", "stock"][max(0, modeControl.selectedSegment)]
+        let mode = ["auto", "claude", "codex", "net", "weather", "stock"][max(0, modeControl.selectedSegment)]
         DeviceClient.setDisplayMode(mode) { [weak self] _ in self?.tick() }
     }
 }

@@ -4,8 +4,9 @@ import Foundation
 // isolation - or for skipping WiFi setup entirely. Scans for CH340-style
 // serial ports, handshakes, then pushes the same payloads the device would
 // otherwise poll over HTTP, as newline-terminated frames:
-//   bridge -> device:  #HELLO   #STATUS {json}   #NET {json}   #CMD {json}
+//   bridge -> device:  #HELLO   #STATUS {json}   #NET {json}   #WEATHER {json}
 //   device -> bridge:  #DEVICE {"name":"aiclock","fw":"x.y.z"}
+//                       #STOCK_CONFIG {"symbols":[...]}
 // Device log lines (anything not starting with '#') are ignored.
 //
 // NOTE: the port is opened non-exclusively so esptool/pio can still flash,
@@ -14,6 +15,7 @@ final class SerialLink {
     private let service: StatusService
     private let netMonitor: NetSpeedMonitor
     private let stockMonitor: StockMonitor
+    private let weatherMonitor: WeatherMonitor
 
     private var fd: Int32 = -1
     private var portPath = ""
@@ -22,13 +24,16 @@ final class SerialLink {
     private var lastHelloAt = Date.distantPast
     private var lastStatusAt = Date.distantPast
     private var lastNetAt = Date.distantPast
+    private var lastWeatherAt = Date.distantPast
     private var rxBuf = Data()
     private var timer: Timer?
 
-    init(service: StatusService, netMonitor: NetSpeedMonitor, stockMonitor: StockMonitor) {
+    init(service: StatusService, netMonitor: NetSpeedMonitor, stockMonitor: StockMonitor,
+         weatherMonitor: WeatherMonitor) {
         self.service = service
         self.netMonitor = netMonitor
         self.stockMonitor = stockMonitor
+        self.weatherMonitor = weatherMonitor
     }
 
     func start() {
@@ -68,6 +73,10 @@ final class SerialLink {
             lastNetAt = now
             let stats = SystemStatsMonitor.shared.snapshot()
             send(frame("#NET ", netMonitor.jsonData(cpu: stats.cpu, mem: stats.mem)))
+        }
+        if now.timeIntervalSince(lastWeatherAt) > 10 {
+            lastWeatherAt = now
+            send(frame("#WEATHER ", weatherMonitor.jsonData()))
         }
     }
 
@@ -156,7 +165,15 @@ final class SerialLink {
                     linked = true
                     lastStatusAt = .distantPast // push a status immediately
                     lastNetAt = .distantPast
+                    lastWeatherAt = .distantPast
                     FileHandle.standardError.write(Data("[serial] linked \(portPath): \(line)\n".utf8))
+                }
+            } else if line.hasPrefix("#STOCK_CONFIG "),
+                      let body = String(line.dropFirst("#STOCK_CONFIG ".count)).data(using: .utf8) {
+                let response = stockMonitor.updateConfig(json: body)
+                if let object = try? JSONSerialization.jsonObject(with: response) as? [String: Any],
+                   object["ok"] as? Bool == true {
+                    FileHandle.standardError.write(Data("[serial] applied device stock config\n".utf8))
                 }
             }
             // anything else is the device's debug log - ignore

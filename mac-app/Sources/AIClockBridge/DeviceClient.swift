@@ -8,8 +8,9 @@ struct DeviceInfo {
     var ip = ""
     var ssid = ""
     var bridge = ""
-    var mode = "auto"       // configured: auto | claude | codex | net | music
-    var effective = "auto"  // what's actually on screen (AUTO may promote to music)
+    var mode = "auto"       // configured: auto | claude | codex | net | weather | stock
+    var clockTheme = "classic"
+    var effective = "auto"  // what's actually on screen
     var showing = ""
     var lastUpdateS = -1    // seconds since the device last got /status data, -1 = never
     var spriteRev = 0       // bumped by the device on animation change
@@ -21,12 +22,29 @@ struct DeviceInfo {
 }
 
 final class DeviceClient {
+    enum AutoPairResult {
+        case paired(String)
+        case notFound
+        case cancelled
+    }
+
     private static let hostKey = "device_host"
     private static let lastSeenKey = "device_last_seen"
+    private static let deviceIDKey = "device_id"
+    private static var pollVerifications = Set<String>()
+    private static var pairingGeneration = 0
+    private static var verifiedDeviceIP = ""
+    private static var verifiedDeviceID = ""
 
     static var host: String {
         get { UserDefaults.standard.string(forKey: hostKey) ?? "" }
-        set { UserDefaults.standard.set(newValue, forKey: hostKey) }
+        set {
+            UserDefaults.standard.set(newValue, forKey: hostKey)
+            UserDefaults.standard.removeObject(forKey: deviceIDKey)
+            verifiedDeviceIP = ""
+            verifiedDeviceID = ""
+            pairingGeneration &+= 1
+        }
     }
 
     /// Last LAN address that polled our /status — i.e. the clock itself.
@@ -60,6 +78,7 @@ final class DeviceClient {
                 info.ssid = obj["ssid"] as? String ?? ""
                 info.bridge = obj["bridge"] as? String ?? ""
                 info.mode = obj["mode"] as? String ?? "auto"
+                info.clockTheme = obj["clock_theme"] as? String ?? "classic"
                 info.effective = obj["effective"] as? String ?? info.mode
                 info.showing = obj["showing"] as? String ?? ""
                 info.lastUpdateS = (obj["last_update_s"] as? NSNumber)?.intValue ?? -1
@@ -81,7 +100,7 @@ final class DeviceClient {
         }.resume()
     }
 
-    /// POST /api/display  mode=auto|claude|codex|net|music
+    /// POST /api/display  mode=auto|claude|codex|net|weather|stock
     static func setDisplayMode(_ mode: String, completion: @escaping (Error?) -> Void) {
         postForm(path: "api/display", fields: ["mode": mode], completion: completion)
     }
@@ -120,7 +139,16 @@ final class DeviceClient {
 
     /// POST /sprite/{claude|codex}/reset — back to the compiled-in animation.
     static func resetSprite(slot: String, completion: @escaping (Error?) -> Void) {
-        postForm(path: "sprite/\(slot)/reset", fields: [:], completion: completion)
+        fetchInfo { result in
+            switch result {
+            case let .success(info):
+                postForm(path: "sprite/\(slot)/reset",
+                         fields: ["expected_rev": String(info.spriteRev)],
+                         completion: completion)
+            case let .failure(error):
+                completion(error)
+            }
+        }
     }
 
     /// GET /sprite/{claude|codex}/raw — the animation the device is actually
@@ -205,29 +233,105 @@ final class DeviceClient {
         }.resume()
     }
 
+    private static func fetchDeviceIdentity(ip: String, completion: @escaping (String?) -> Void) {
+        guard let url = URL(string: "http://\(ip)/api/info") else {
+            completion(nil)
+            return
+        }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 2
+        URLSession.shared.dataTask(with: request) { data, _, _ in
+            let identity = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+                .flatMap { object -> String? in
+                    guard object["mode"] is String, object["sprite_rev"] != nil,
+                          let deviceID = object["device_id"] as? String, !deviceID.isEmpty else { return nil }
+                    return deviceID
+                }
+            DispatchQueue.main.async { completion(identity) }
+        }.resume()
+    }
+
+    /// Verifies an already configured host on launch and upgrades legacy
+    /// host-only preferences to an identity-bound pairing. A stale response
+    /// cannot overwrite a host selected while the request was in flight.
+    static func verifyConfiguredDeviceIdentity(attempts: Int = 3,
+                                               completion: @escaping (Bool) -> Void) {
+        let ip = configuredDeviceIP(host)
+        guard !ip.isEmpty else {
+            completion(false)
+            return
+        }
+        let expectedID = UserDefaults.standard.string(forKey: deviceIDKey) ?? ""
+        let generation = pairingGeneration
+
+        func attempt(_ remaining: Int) {
+            guard generation == pairingGeneration, configuredDeviceIP(host) == ip else {
+                completion(false)
+                return
+            }
+            fetchDeviceIdentity(ip: ip) { identity in
+                guard generation == pairingGeneration, configuredDeviceIP(host) == ip else {
+                    completion(false)
+                    return
+                }
+                if let identity {
+                    guard expectedID.isEmpty || expectedID == identity else {
+                        completion(false)
+                        return
+                    }
+                    completion(bindVerifiedDevice(ip: ip, identity: identity,
+                                                  expectedGeneration: generation))
+                } else if remaining > 1 {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                        attempt(remaining - 1)
+                    }
+                } else {
+                    completion(false)
+                }
+            }
+        }
+        attempt(max(1, attempts))
+    }
+
     /// Finds the clock and pairs (sets `host`). Strategy:
     ///  1. the address that most recently polled our /status (no scanning);
     ///  2. the currently configured host, re-verified;
     ///  3. sweep this Mac's /24 subnet for /api/info (covers a factory-fresh
     ///     device that has WiFi but no bridge configured yet).
-    static func autoPair(progress: @escaping (String) -> Void,
-                         completion: @escaping (String?) -> Void) {
+    static func autoPair(requiredDeviceID: String? = nil,
+                         progress: @escaping (String) -> Void,
+                         completion: @escaping (AutoPairResult) -> Void) {
+        pairingGeneration &+= 1
+        let generation = pairingGeneration
         var candidates: [String] = []
         if !lastSeenIP.isEmpty { candidates.append(lastSeenIP) }
         let configured = host.split(separator: ":").first.map(String.init) ?? host
         if !configured.isEmpty, !candidates.contains(configured) { candidates.append(configured) }
 
         func tryNext() {
+            guard generation == pairingGeneration else {
+                completion(.cancelled)
+                return
+            }
             guard let ip = candidates.first else {
-                scanSubnet(progress: progress, completion: completion)
+                scanSubnet(requiredDeviceID: requiredDeviceID, generation: generation,
+                           progress: progress, completion: completion)
                 return
             }
             candidates.removeFirst()
             progress("验证 \(ip)…")
-            verifyDevice(ip: ip) { ok in
-                if ok {
-                    host = ip
-                    completion(ip)
+            fetchDeviceIdentity(ip: ip) { identity in
+                guard generation == pairingGeneration else {
+                    completion(.cancelled)
+                    return
+                }
+                if let identity, requiredDeviceID == nil || identity == requiredDeviceID {
+                    guard bindVerifiedDevice(ip: ip, identity: identity,
+                                             expectedGeneration: generation) else {
+                        completion(.cancelled)
+                        return
+                    }
+                    completion(.paired(ip))
                 } else {
                     tryNext()
                 }
@@ -238,11 +342,16 @@ final class DeviceClient {
 
     /// Parallel sweep of the local /24 (254 hosts, ~0.8s timeout each,
     /// 32-wide). Only used when the passive route came up empty.
-    private static func scanSubnet(progress: @escaping (String) -> Void,
-                                   completion: @escaping (String?) -> Void) {
+    private static func scanSubnet(requiredDeviceID: String?, generation: Int,
+                                   progress: @escaping (String) -> Void,
+                                   completion: @escaping (AutoPairResult) -> Void) {
+        guard generation == pairingGeneration else {
+            completion(.cancelled)
+            return
+        }
         guard let myIP = localIPv4(),
               let prefixEnd = myIP.range(of: ".", options: .backwards)?.lowerBound else {
-            completion(nil)
+            completion(.notFound)
             return
         }
         let prefix = String(myIP[..<prefixEnd])
@@ -255,7 +364,7 @@ final class DeviceClient {
         }()
         let group = DispatchGroup()
         let lock = NSLock()
-        var found: String?
+        var found: (ip: String, identity: String)?
         let sem = DispatchSemaphore(value: 32)
         DispatchQueue.global(qos: .utility).async {
             for n in 1...254 {
@@ -268,11 +377,15 @@ final class DeviceClient {
                 if alreadyFound { sem.signal(); continue }
                 group.enter()
                 let task = session.dataTask(with: URL(string: "http://\(ip)/api/info")!) { data, _, _ in
-                    let ok = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
-                        .map { $0["mode"] is String && $0["sprite_rev"] != nil } ?? false
-                    if ok {
+                    let identity = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+                        .flatMap { object -> String? in
+                            guard object["mode"] is String, object["sprite_rev"] != nil,
+                                  let value = object["device_id"] as? String, !value.isEmpty else { return nil }
+                            return value
+                        }
+                    if let identity, requiredDeviceID == nil || identity == requiredDeviceID {
                         lock.lock()
-                        if found == nil { found = ip }
+                        if found == nil { found = (ip, identity) }
                         lock.unlock()
                     }
                     sem.signal()
@@ -281,16 +394,71 @@ final class DeviceClient {
                 task.resume()
             }
             group.notify(queue: .main) {
-                if let ip = found { host = ip }
-                completion(found)
+                guard generation == pairingGeneration else {
+                    completion(.cancelled)
+                    return
+                }
+                if let found {
+                    guard bindVerifiedDevice(ip: found.ip, identity: found.identity,
+                                             expectedGeneration: generation) else {
+                        completion(.cancelled)
+                        return
+                    }
+                    completion(.paired(found.ip))
+                } else {
+                    completion(.notFound)
+                }
             }
         }
     }
 
     // MARK: - pairing watchdog
 
-    /// Stamped on every device poll of our /status|/net|/music (see main.swift).
+    /// Stamped on every device poll of our bridge feeds (see main.swift).
     static var devicePollAt = Date.distantPast
+
+    static func recordDevicePoll(ip: String) {
+        DispatchQueue.main.async {
+            let configuredIP = configuredDeviceIP(host)
+            let expectedID = UserDefaults.standard.string(forKey: deviceIDKey) ?? ""
+            if configuredIP == ip, !expectedID.isEmpty,
+               verifiedDeviceIP == ip, verifiedDeviceID == expectedID {
+                devicePollAt = Date()
+                lastSeenIP = ip
+                return
+            }
+            guard pollVerifications.insert(ip).inserted else { return }
+            let generation = pairingGeneration
+            fetchDeviceIdentity(ip: ip) { identity in
+                pollVerifications.remove(ip)
+                guard generation == pairingGeneration else { return }
+                guard let identity else { return }
+                let currentExpectedID = UserDefaults.standard.string(forKey: deviceIDKey) ?? ""
+                let currentConfiguredIP = configuredDeviceIP(host)
+                let firstPair = currentConfiguredIP.isEmpty && currentExpectedID.isEmpty
+                let configuredMatch = currentConfiguredIP == ip
+                    && (currentExpectedID.isEmpty || currentExpectedID == identity)
+                let dhcpMatch = !currentExpectedID.isEmpty && currentExpectedID == identity
+                guard firstPair || configuredMatch || dhcpMatch else { return }
+                _ = bindVerifiedDevice(ip: ip, identity: identity,
+                                       expectedGeneration: generation)
+            }
+        }
+    }
+
+    @discardableResult
+    private static func bindVerifiedDevice(ip: String, identity: String,
+                                           expectedGeneration: Int) -> Bool {
+        guard expectedGeneration == pairingGeneration else { return false }
+        pairingGeneration &+= 1
+        UserDefaults.standard.set(ip, forKey: hostKey)
+        UserDefaults.standard.set(identity, forKey: deviceIDKey)
+        verifiedDeviceIP = ip
+        verifiedDeviceID = identity
+        devicePollAt = Date()
+        lastSeenIP = ip
+        return true
+    }
 
     private static var healInFlight = false
     private static var lastHealAttempt = Date.distantPast
@@ -305,12 +473,16 @@ final class DeviceClient {
     static func healPairingIfNeeded(port: UInt16) {
         guard Date().timeIntervalSince(devicePollAt) > 180 else { return } // device is polling us
         guard !healInFlight, Date().timeIntervalSince(lastHealAttempt) > 300 else { return }
+        let expectedID = UserDefaults.standard.string(forKey: deviceIDKey) ?? ""
+        guard !expectedID.isEmpty else { return }
         healInFlight = true
         lastHealAttempt = Date()
-        autoPair(progress: { _ in }) { ip in
-            guard ip != nil else { healInFlight = false; return }
+        autoPair(requiredDeviceID: expectedID, progress: { _ in }) { result in
+            guard case .paired = result else { healInFlight = false; return }
+            let generation = pairingGeneration
             fetchInfo { result in
                 defer { healInFlight = false }
+                guard generation == pairingGeneration else { return }
                 guard case let .success(info) = result, let myIP = localIPv4() else { return }
                 let stale = info.lastUpdateS < 0 || info.lastUpdateS > 60
                 guard info.bridge.isEmpty || stale else { return }
@@ -322,13 +494,34 @@ final class DeviceClient {
         }
     }
 
-    /// LAN IPv4 of this Mac (en0 preferred) — used for one-click "point the
-    /// device's bridge at this Mac".
-    static func localIPv4() -> String? {
+    static func shouldRecordDevicePoll(path: String, ip: String,
+                                       localAddresses: Set<String>) -> Bool {
+        let pollPaths: Set<String> = ["/status", "/net", "/music", "/stock", "/weather"]
+        return pollPaths.contains(path) && !ip.isEmpty && !ip.contains(":")
+            && !ip.hasPrefix("127.") && !localAddresses.contains(ip)
+    }
+
+    static func shouldAcceptBridgePost(path: String, ip: String,
+                                       deviceHost: String, lastSeenIP: String) -> Bool {
+        if path == "/event" { return ip == "127.0.0.1" || ip == "::1" }
+        guard path == "/stock/config", !ip.isEmpty, !ip.contains(":") else { return false }
+        let configuredIP = configuredDeviceIP(deviceHost)
+        if !configuredIP.isEmpty { return ip == configuredIP }
+        return !lastSeenIP.isEmpty && ip == lastSeenIP
+    }
+
+    private static func configuredDeviceIP(_ raw: String) -> String {
+        let host = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let urlText = host.contains("://") ? host : "http://\(host)"
+        return URLComponents(string: urlText)?.host ?? ""
+    }
+
+
+    private static func ipv4Interfaces() -> [(name: String, ip: String)] {
+        var result: [(name: String, ip: String)] = []
         var addrs: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&addrs) == 0, let first = addrs else { return nil }
+        guard getifaddrs(&addrs) == 0, let first = addrs else { return result }
         defer { freeifaddrs(addrs) }
-        var best: String?
         for ptr in sequence(first: first, next: { $0.pointee.ifa_next }) {
             let ifa = ptr.pointee
             guard let sa = ifa.ifa_addr, sa.pointee.sa_family == UInt8(AF_INET),
@@ -337,11 +530,19 @@ final class DeviceClient {
             var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
             guard getnameinfo(sa, socklen_t(sa.pointee.sa_len), &host, socklen_t(host.count),
                               nil, 0, NI_NUMERICHOST) == 0 else { continue }
-            let name = String(cString: ifa.ifa_name)
-            let ip = String(cString: host)
-            if name == "en0" { return ip }
-            if best == nil { best = ip }
+            result.append((String(cString: ifa.ifa_name), String(cString: host)))
         }
-        return best
+        return result
+    }
+
+    static func localIPv4Addresses() -> Set<String> {
+        Set(ipv4Interfaces().map(\.ip))
+    }
+
+    /// LAN IPv4 of this Mac (en0 preferred) — used for one-click "point the
+    /// device's bridge at this Mac".
+    static func localIPv4() -> String? {
+        let interfaces = ipv4Interfaces()
+        return interfaces.first(where: { $0.name == "en0" })?.ip ?? interfaces.first?.ip
     }
 }

@@ -37,11 +37,60 @@ struct Snapshot {
     var musicPlaying: Bool = false
 }
 
-/// Reads the logs and derives status, with a small time cache so back-to-back
-/// HTTP polls and the menu-bar timer don't each re-scan the whole tree.
+/// Reads logs into a background incremental index; snapshots only read last-good state.
 final class StatusService {
-    private let claudeDir = ("~/.claude/projects" as NSString).expandingTildeInPath
-    private let codexDir = ("~/.codex/sessions" as NSString).expandingTildeInPath
+    struct DebugMetrics {
+        let claudeBytesRead: Int
+        let codexBytesRead: Int
+        let scanCount: Int
+    }
+
+    private struct FileCursor {
+        var inode: UInt64
+        var size: UInt64
+        var offset: UInt64
+        var partialLine = Data()
+    }
+
+    private struct ClaudeFileIndex {
+        var cursor: FileCursor
+        var mtime: TimeInterval
+        var tokensToday = 0
+        var usageEpochs: [TimeInterval] = []
+    }
+
+    private struct CodexFileIndex {
+        var cursor: FileCursor
+        var mtime: TimeInterval
+        var totalTokens = 0
+        var rateLimits: [String: Any]?
+        var rateLimitsTs: TimeInterval = 0
+    }
+
+    private struct FileMetadata {
+        let url: URL
+        let inode: UInt64
+        let size: UInt64
+        let mtime: TimeInterval
+    }
+
+    private struct RoundMetrics {
+        var claudeBytesRead = 0
+        var codexBytesRead = 0
+    }
+
+    private static let claudeUsageMarker = Data("\"usage\":{".utf8)
+    private static let codexTokenMarker = Data("\"token_count\"".utf8)
+    private static let readChunkSize = 256 * 1024
+
+    private let claudeDir: URL
+    private let codexDir: URL
+    private let nowProvider: () -> TimeInterval
+    private let uptimeProvider: () -> TimeInterval
+    private let refreshInterval: TimeInterval
+    private let openFileProvider: (URL) throws -> FileHandle
+    private let readChunkProvider: (FileHandle, Int) throws -> Data?
+    private let refreshQueue = DispatchQueue(label: "AIClockBridge.status-index", qos: .utility)
 
     /// Real OAuth quota (5h/weekly windows) merged into snapshots when set;
     /// log-derived values remain the fallback for offline use.
@@ -95,9 +144,9 @@ final class StatusService {
     /// Called by the /event endpoint. Unknown event names are ignored.
     /// `message` is only sent for Claude's Notification hook.
     func recordEvent(agent: String, event: String, message: String? = nil) {
-        lock.lock()
-        defer { lock.unlock() }
-        let now = Date().timeIntervalSince1970
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        let now = nowProvider()
         // Claude Notification: flash only for permission prompts, not for
         // "task done / waiting for your input" notifications.
         if event == "Notification" {
@@ -140,11 +189,17 @@ final class StatusService {
 
     private let workingThreshold: TimeInterval = 20        // log touched within this -> "working"
     private let idleThreshold: TimeInterval = 30 * 60      // within this -> "idle", else "offline"
-    private let cacheTTL: TimeInterval = 5
+    private let stateLock = NSLock()
+    private var lastGood: Snapshot
+    private var completedUptime: TimeInterval?
+    private var refreshInFlight = false
+    private var completedScans = 0
+    private var lastRoundMetrics = RoundMetrics()
 
-    private let lock = NSLock()
-    private var cached: Snapshot?
-    private var cachedAt: TimeInterval = 0
+    // Queue-confined index state. Log IO never runs while stateLock is held.
+    private var indexedDayStart: TimeInterval?
+    private var claudeIndexes: [String: ClaudeFileIndex] = [:]
+    private var codexIndexes: [String: CodexFileIndex] = [:]
 
     private let isoFrac: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
@@ -157,17 +212,54 @@ final class StatusService {
         return f
     }()
 
+    init(
+        claudeDir: URL = URL(fileURLWithPath: ("~/.claude/projects" as NSString).expandingTildeInPath,
+                             isDirectory: true),
+        codexDir: URL = URL(fileURLWithPath: ("~/.codex/sessions" as NSString).expandingTildeInPath,
+                            isDirectory: true),
+        now: @escaping () -> TimeInterval = { Date().timeIntervalSince1970 },
+        uptime: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        refreshInterval: TimeInterval = 15,
+        openFile: @escaping (URL) throws -> FileHandle = { try FileHandle(forReadingFrom: $0) },
+        readChunk: @escaping (FileHandle, Int) throws -> Data? = { try $0.read(upToCount: $1) }
+    ) {
+        self.claudeDir = claudeDir
+        self.codexDir = codexDir
+        self.nowProvider = now
+        self.uptimeProvider = uptime
+        self.refreshInterval = max(0, refreshInterval)
+        self.openFileProvider = openFile
+        self.readChunkProvider = readChunk
+        let epoch = now()
+        self.lastGood = Snapshot(claude: ClaudeStatus(), codex: CodexStatus(), ts: Int(epoch))
+    }
+
+    var debugMetrics: DebugMetrics {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return DebugMetrics(claudeBytesRead: lastRoundMetrics.claudeBytesRead,
+                            codexBytesRead: lastRoundMetrics.codexBytesRead,
+                            scanCount: completedScans)
+    }
+
     func snapshot() -> Snapshot {
-        lock.lock()
-        defer { lock.unlock() }
-        let now = Date().timeIntervalSince1970
-        var snap: Snapshot
-        if let c = cached, now - cachedAt < cacheTTL {
-            snap = c
-        } else {
-            snap = Snapshot(claude: readClaude(), codex: readCodex(), ts: Int(now))
-            cached = snap
-            cachedAt = now
+        let now = nowProvider()
+        let uptime = uptimeProvider()
+        var shouldRefresh = false
+        stateLock.lock()
+        var snap = lastGood
+        if (completedUptime.map { uptime - $0 >= refreshInterval } ?? true), !refreshInFlight {
+            refreshInFlight = true
+            shouldRefresh = true
+        }
+        let currentClaudeEvent = claudeEvent
+        let currentCodexEvent = codexEvent
+        let currentClaudeNeedsInputAt = claudeNeedsInputAt
+        let currentCodexNeedsInputAt = codexNeedsInputAt
+        stateLock.unlock()
+
+        if shouldRefresh {
+            refreshQueue.async { [weak self] in self?.refreshAndPublish() }
         }
         snap.ts = Int(now)
 
@@ -189,12 +281,45 @@ final class StatusService {
                 snap.codex.weeklyResetMin = codexUsage.weeklyResetMin
             }
         }
-        snap.claude.status = overrideStatus(snap.claude.status, with: claudeEvent, now: now)
-        snap.codex.status = overrideStatus(snap.codex.status, with: codexEvent, now: now)
-        snap.claude.needsInput = needsInput(claudeNeedsInputAt, now: now)
-        snap.codex.needsInput = needsInput(codexNeedsInputAt, now: now)
+        snap.claude.status = overrideStatus(snap.claude.status, with: currentClaudeEvent, now: now)
+        snap.codex.status = overrideStatus(snap.codex.status, with: currentCodexEvent, now: now)
+        snap.claude.needsInput = needsInput(currentClaudeNeedsInputAt, now: now)
+        snap.codex.needsInput = needsInput(currentCodexNeedsInputAt, now: now)
         snap.musicPlaying = musicPlayingProvider?() ?? false
         return snap
+    }
+
+    /// Deterministic seam for the executable self-test. Production callers use snapshot().
+    func refreshSynchronouslyForTesting() {
+        refreshQueue.sync { refreshAndPublish() }
+    }
+
+    private func refreshAndPublish() {
+        let now = nowProvider()
+        let todayStart = startOfDay(now)
+        stateLock.lock()
+        let previous = lastGood
+        stateLock.unlock()
+        if indexedDayStart != todayStart {
+            indexedDayStart = todayStart
+            claudeIndexes.removeAll(keepingCapacity: true)
+            codexIndexes.removeAll(keepingCapacity: true)
+        }
+
+        var metrics = RoundMetrics()
+        let snapshot = Snapshot(
+            claude: readClaude(now: now, todayStart: todayStart, metrics: &metrics) ?? previous.claude,
+            codex: readCodex(now: now, metrics: &metrics) ?? previous.codex,
+            ts: Int(now)
+        )
+        let completed = uptimeProvider()
+        stateLock.lock()
+        lastGood = snapshot
+        completedUptime = completed
+        refreshInFlight = false
+        completedScans += 1
+        lastRoundMetrics = metrics
+        stateLock.unlock()
     }
 
     // MARK: - helpers
@@ -212,14 +337,126 @@ final class StatusService {
         return nil
     }
 
-    private func todayStartEpoch() -> Double {
-        Calendar.current.startOfDay(for: Date()).timeIntervalSince1970
+    private func startOfDay(_ epoch: TimeInterval) -> TimeInterval {
+        Calendar.current.startOfDay(for: Date(timeIntervalSince1970: epoch)).timeIntervalSince1970
     }
 
-    /// Lossy UTF-8 read (matches Python's errors="ignore") split into lines.
-    private func readLines(_ url: URL) -> [Substring]? {
-        guard let data = try? Data(contentsOf: url) else { return nil }
-        return String(decoding: data, as: UTF8.self).split(separator: "\n", omittingEmptySubsequences: true)
+    private func metadata(for url: URL) -> FileMetadata? {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              attrs[.type] as? FileAttributeType == .typeRegular,
+              let size = (attrs[.size] as? NSNumber)?.uint64Value,
+              let mtime = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970 else { return nil }
+        return FileMetadata(url: url,
+                            inode: (attrs[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0,
+                            size: size, mtime: mtime)
+    }
+
+    private func jsonlFiles(in root: URL, recursive: Bool) -> [FileMetadata]? {
+        let fm = FileManager.default
+        var isDirectory: ObjCBool = false
+        guard fm.fileExists(atPath: root.path, isDirectory: &isDirectory) else { return [] }
+        guard isDirectory.boolValue else { return nil }
+        let urls: [URL]
+        if recursive {
+            var enumerationFailed = false
+            guard let enumerator = fm.enumerator(at: root, includingPropertiesForKeys: nil,
+                                                 options: [.skipsHiddenFiles],
+                                                 errorHandler: { _, _ in
+                                                     enumerationFailed = true
+                                                     return false
+                                                 }) else { return nil }
+            urls = enumerator.compactMap { $0 as? URL }
+            if enumerationFailed { return nil }
+        } else {
+            do {
+                urls = try fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil,
+                                                  options: [.skipsHiddenFiles])
+            } catch {
+                return nil
+            }
+        }
+        var files: [FileMetadata] = []
+        for url in urls where url.pathExtension == "jsonl" {
+            guard let value = metadata(for: url) else { return nil }
+            files.append(value)
+        }
+        return files.sorted { $0.url.path < $1.url.path }
+    }
+
+    private func resetCursorIfNeeded(_ cursor: inout FileCursor, metadata: FileMetadata) -> Bool {
+        guard cursor.inode == metadata.inode, metadata.size >= cursor.offset,
+              metadata.size >= cursor.size else {
+            cursor = FileCursor(inode: metadata.inode, size: metadata.size, offset: 0)
+            return true
+        }
+        return false
+    }
+
+    private func containsRawMarker(_ data: Data, range: Range<Int>, marker: Data) -> Bool {
+        guard marker.count > 0, range.count >= marker.count else { return false }
+        return data.withUnsafeBytes { rawData in
+            marker.withUnsafeBytes { rawMarker in
+                let bytes = rawData.bindMemory(to: UInt8.self)
+                let needle = rawMarker.bindMemory(to: UInt8.self)
+                for start in range.lowerBound...(range.upperBound - marker.count) {
+                    var matched = true
+                    for i in 0..<marker.count where bytes[start + i] != needle[i] {
+                        matched = false
+                        break
+                    }
+                    if matched { return true }
+                }
+                return false
+            }
+        }
+    }
+
+    private func readAppended(
+        _ metadata: FileMetadata,
+        cursor: inout FileCursor,
+        bytesRead: inout Int,
+        line: (Data, Range<Int>) -> Void
+    ) -> Bool {
+        guard cursor.offset < metadata.size else {
+            cursor.size = metadata.size
+            return true
+        }
+        let originalCursor = cursor
+        guard let handle = try? openFileProvider(metadata.url) else { return false }
+        defer { try? handle.close() }
+        var roundBytesRead = 0
+        do {
+            try handle.seek(toOffset: cursor.offset)
+            var buffer = cursor.partialLine
+            while cursor.offset < metadata.size {
+                let wanted = Int(min(UInt64(Self.readChunkSize), metadata.size - cursor.offset))
+                guard let chunk = try readChunkProvider(handle, wanted), !chunk.isEmpty else {
+                    cursor = originalCursor
+                    return false
+                }
+                let oldCount = buffer.count
+                buffer.append(chunk)
+                cursor.offset += UInt64(chunk.count)
+                roundBytesRead += chunk.count
+
+                var lineStart = 0
+                if buffer.count > oldCount {
+                    for index in oldCount..<buffer.count where buffer[index] == 0x0a {
+                        if index > lineStart { line(buffer, lineStart..<index) }
+                        lineStart = index + 1
+                    }
+                }
+                if lineStart > 0 { buffer.removeSubrange(0..<lineStart) }
+                if chunk.count < wanted { break }
+            }
+            cursor.partialLine = buffer
+            cursor.size = metadata.size
+            bytesRead += roundBytesRead
+            return true
+        } catch {
+            cursor = originalCursor
+            return false
+        }
     }
 
     private func intVal(_ any: Any?) -> Int {
@@ -228,113 +465,288 @@ final class StatusService {
 
     // MARK: - Claude
 
-    private func readClaude() -> ClaudeStatus {
-        let todayStart = todayStartEpoch()
-        let now = Date().timeIntervalSince1970
-        var tokensToday = 0
+    private func readClaude(now: TimeInterval, todayStart: TimeInterval,
+                            metrics: inout RoundMetrics) -> ClaudeStatus? {
+        let originalIndexes = claudeIndexes
         var lastMtime: TimeInterval = 0
-        var firstActiveInWindow: Double? = nil
+        var seen: Set<String> = []
+        guard let files = jsonlFiles(in: claudeDir, recursive: true) else { return nil }
+        for metadata in files {
+            let path = metadata.url.path
+            seen.insert(path)
+            lastMtime = max(lastMtime, metadata.mtime)
 
-        let fm = FileManager.default
-        let root = URL(fileURLWithPath: claudeDir)
-        if let en = fm.enumerator(at: root, includingPropertiesForKeys: [.contentModificationDateKey]) {
-            for case let url as URL in en where url.pathExtension == "jsonl" {
-                guard let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
-                    .contentModificationDate?.timeIntervalSince1970 else { continue }
-                if mtime > lastMtime { lastMtime = mtime }
-                if mtime < todayStart { continue } // no activity today, skip parsing
-                guard let lines = readLines(url) else { continue }
-                for line in lines {
-                    if !line.contains("\"usage\":{") { continue }
-                    guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
-                          let message = obj["message"] as? [String: Any],
-                          let usage = message["usage"] as? [String: Any] else { continue }
-                    let entryEpoch = parseISO(obj["timestamp"] as? String)
-                    if let e = entryEpoch, e < todayStart { continue }
-                    tokensToday += intVal(usage["input_tokens"]) + intVal(usage["output_tokens"])
-                        + intVal(usage["cache_creation_input_tokens"]) + intVal(usage["cache_read_input_tokens"])
-                    if let e = entryEpoch, now - e < 5 * 3600 {
-                        if firstActiveInWindow == nil || e < firstActiveInWindow! { firstActiveInWindow = e }
-                    }
-                }
+            if metadata.mtime < todayStart, claudeIndexes[path] == nil {
+                claudeIndexes[path] = ClaudeFileIndex(
+                    cursor: FileCursor(inode: metadata.inode, size: metadata.size,
+                                       offset: metadata.size), mtime: metadata.mtime)
+                continue
             }
+
+            var index = claudeIndexes[path] ?? ClaudeFileIndex(
+                cursor: FileCursor(inode: metadata.inode, size: metadata.size, offset: 0),
+                mtime: metadata.mtime)
+            let cursorWasReset = resetCursorIfNeeded(&index.cursor, metadata: metadata)
+            if cursorWasReset {
+                index.tokensToday = 0
+                index.usageEpochs.removeAll(keepingCapacity: true)
+            }
+            if metadata.mtime >= todayStart {
+                let readSucceeded = readAppended(
+                    metadata,
+                    cursor: &index.cursor,
+                    bytesRead: &metrics.claudeBytesRead
+                ) { data, range in
+                    guard self.containsRawMarker(data, range: range,
+                                                 marker: Self.claudeUsageMarker) else { return }
+                    let lineData = data.subdata(in: range)
+                    guard let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
+                          let message = obj["message"] as? [String: Any],
+                          let usage = message["usage"] as? [String: Any] else { return }
+                    let epoch = self.parseISO(obj["timestamp"] as? String)
+                    if let epoch, epoch < todayStart { return }
+                    index.tokensToday += self.intVal(usage["input_tokens"])
+                        + self.intVal(usage["output_tokens"])
+                        + self.intVal(usage["cache_creation_input_tokens"])
+                        + self.intVal(usage["cache_read_input_tokens"])
+                    if let epoch { index.usageEpochs.append(epoch) }
+                }
+                guard readSucceeded else {
+                    claudeIndexes = originalIndexes
+                    return nil
+                }
+            } else {
+                index.cursor.size = metadata.size
+                if cursorWasReset { index.cursor.offset = metadata.size }
+            }
+            index.mtime = metadata.mtime
+            index.usageEpochs.removeAll { $0 < todayStart || now - $0 >= 5 * 3600 }
+            claudeIndexes[path] = index
         }
+        claudeIndexes = claudeIndexes.filter { seen.contains($0.key) }
 
         var s = ClaudeStatus()
-        s.tokensToday = tokensToday
-        if let first = firstActiveInWindow { s.sessionMin = Int((now - first) / 60) }
+        s.tokensToday = claudeIndexes.values.reduce(0) { $0 + $1.tokensToday }
+        if let first = claudeIndexes.values.flatMap(\.usageEpochs).min() {
+            s.sessionMin = max(0, Int((now - first) / 60))
+        }
         s.status = statusFromDelta(lastMtime > 0 ? now - lastMtime : 1e9)
         return s
     }
 
     // MARK: - Codex
 
-    private func readCodex() -> CodexStatus {
-        let now = Date().timeIntervalSince1970
-        var lastMtime: TimeInterval = 0
-        let fm = FileManager.default
-        let root = URL(fileURLWithPath: codexDir)
-
-        // Whole-tree scan just for the freshest mtime (drives working/idle).
-        if let en = fm.enumerator(at: root, includingPropertiesForKeys: [.contentModificationDateKey]) {
-            for case let url as URL in en where url.pathExtension == "jsonl" {
-                if let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
-                    .contentModificationDate?.timeIntervalSince1970, mtime > lastMtime {
-                    lastMtime = mtime
-                }
-            }
+    static func parsedCodexQuota(rateLimits: [String: Any], now: Double) -> CodexStatus {
+        var windows: [CodexQuotaWindow] = []
+        for (key, fallbackMinutes) in [
+            ("primary", 5 * 60),
+            ("secondary", 7 * 24 * 60),
+        ] {
+            guard let window = rateLimits[key] as? [String: Any] else { continue }
+            windows.append(CodexQuotaWindow(
+                usedPercent: (window["used_percent"] as? NSNumber)?.doubleValue,
+                windowMinutes: (window["window_minutes"] as? NSNumber)?.intValue
+                    ?? fallbackMinutes,
+                resetsAt: (window["resets_at"] as? NSNumber)?.doubleValue
+            ))
         }
 
-        // Tokens + rate limits only from today's day directory.
-        let cal = Calendar.current
-        let comps = cal.dateComponents([.year, .month, .day], from: Date())
-        let dayDir = root
-            .appendingPathComponent(String(format: "%04d", comps.year ?? 0))
-            .appendingPathComponent(String(format: "%02d", comps.month ?? 0))
-            .appendingPathComponent(String(format: "%02d", comps.day ?? 0))
+        let classified = classifyCodexQuota(windows)
+        var status = CodexStatus()
+        if let window = classified.primary {
+            status.primaryPct = window.usedPercent
+            status.primaryWindowMin = window.windowMinutes
+            status.primaryResetMin = window.resetsAt.map { max(0, Int(($0 - now) / 60)) }
+        }
+        if let window = classified.weekly {
+            status.weeklyPct = window.usedPercent
+            status.weeklyWindowMin = window.windowMinutes
+            status.weeklyResetMin = window.resetsAt.map { max(0, Int(($0 - now) / 60)) }
+        }
+        return status
+    }
 
-        var tokensToday = 0
-        var latestRateLimits: [String: Any]? = nil
-        var latestRateLimitsTs: Double = 0
+    private func dayDirectory(for epoch: TimeInterval) -> URL {
+        let components = Calendar.current.dateComponents([.year, .month, .day],
+                                                         from: Date(timeIntervalSince1970: epoch))
+        return codexDir
+            .appendingPathComponent(String(format: "%04d", components.year ?? 0))
+            .appendingPathComponent(String(format: "%02d", components.month ?? 0))
+            .appendingPathComponent(String(format: "%02d", components.day ?? 0))
+    }
 
-        if let names = try? fm.contentsOfDirectory(at: dayDir, includingPropertiesForKeys: nil) {
-            for url in names where url.pathExtension == "jsonl" {
-                guard let lines = readLines(url) else { continue }
-                var sessionMaxTokens = 0
-                for line in lines {
-                    if !line.contains("\"token_count\"") { continue }
-                    guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
-                          let payload = obj["payload"] as? [String: Any],
-                          payload["type"] as? String == "token_count" else { continue }
-                    let info = payload["info"] as? [String: Any]
-                    let totalUsage = info?["total_token_usage"] as? [String: Any]
-                    let total = intVal(totalUsage?["total_tokens"])
-                    if total > sessionMaxTokens { sessionMaxTokens = total }
-                    if let rl = payload["rate_limits"] as? [String: Any] {
-                        let e = parseISO(obj["timestamp"] as? String) ?? 0
-                        if e >= latestRateLimitsTs { latestRateLimitsTs = e; latestRateLimits = rl }
+    private func codexValues(in data: Data, range: Range<Int>)
+        -> (total: Int?, rateLimits: [String: Any]?, timestamp: TimeInterval)? {
+        guard containsRawMarker(data, range: range, marker: Self.codexTokenMarker),
+              let obj = try? JSONSerialization.jsonObject(with: data.subdata(in: range)) as? [String: Any],
+              let payload = obj["payload"] as? [String: Any],
+              payload["type"] as? String == "token_count" else { return nil }
+        let info = payload["info"] as? [String: Any]
+        let totalUsage = info?["total_token_usage"] as? [String: Any]
+        let total = (totalUsage?["total_tokens"] as? NSNumber)?.intValue
+        return (total, payload["rate_limits"] as? [String: Any],
+                parseISO(obj["timestamp"] as? String) ?? 0)
+    }
+
+    private func bootstrapCodex(_ metadata: FileMetadata,
+                                metrics: inout RoundMetrics) -> CodexFileIndex? {
+        var index = CodexFileIndex(
+            cursor: FileCursor(inode: metadata.inode, size: metadata.size,
+                               offset: metadata.size), mtime: metadata.mtime)
+        guard metadata.size > 0 else { return index }
+        guard let handle = try? openFileProvider(metadata.url) else { return nil }
+        defer { try? handle.close() }
+        var roundBytesRead = 0
+
+        var position = metadata.size
+        var rightFragment = Data()
+        var needsEOFPartial = true
+        var foundTotal = false
+        var foundRateLimits = false
+
+        while position > 0, !(foundTotal && foundRateLimits) {
+            let count = Int(min(UInt64(Self.readChunkSize), position))
+            let start = position - UInt64(count)
+            do {
+                try handle.seek(toOffset: start)
+            } catch {
+                return nil
+            }
+            let maybeBlock: Data?
+            do {
+                maybeBlock = try readChunkProvider(handle, count)
+            } catch {
+                return nil
+            }
+            guard let block = maybeBlock, block.count == count else { return nil }
+            roundBytesRead += block.count
+            var combined = block
+            combined.append(rightFragment)
+
+            if needsEOFPartial {
+                if let newline = combined.lastIndex(of: 0x0a) {
+                    index.cursor.partialLine = combined.subdata(in: (newline + 1)..<combined.count)
+                    combined.removeSubrange((newline + 1)..<combined.count)
+                    needsEOFPartial = false
+                } else {
+                    rightFragment = combined
+                    position = start
+                    if start == 0 {
+                        index.cursor.partialLine = combined
+                        needsEOFPartial = false
                     }
+                    continue
                 }
-                tokensToday += sessionMaxTokens
             }
+
+            let parseStart: Int
+            if start > 0 {
+                guard let newline = combined.firstIndex(of: 0x0a) else {
+                    rightFragment = combined
+                    position = start
+                    continue
+                }
+                rightFragment = combined.subdata(in: 0..<(newline + 1))
+                parseStart = newline + 1
+            } else {
+                rightFragment.removeAll(keepingCapacity: true)
+                parseStart = 0
+            }
+
+            var ranges: [Range<Int>] = []
+            var lineStart = parseStart
+            if parseStart < combined.count {
+                for offset in parseStart..<combined.count where combined[offset] == 0x0a {
+                    if offset > lineStart { ranges.append(lineStart..<offset) }
+                    lineStart = offset + 1
+                }
+            }
+            for range in ranges.reversed() {
+                guard let values = codexValues(in: combined, range: range) else { continue }
+                if let total = values.total {
+                    index.totalTokens = max(index.totalTokens, total)
+                    foundTotal = true
+                }
+                if let rateLimits = values.rateLimits, !foundRateLimits {
+                    index.rateLimits = rateLimits
+                    index.rateLimitsTs = values.timestamp
+                    foundRateLimits = true
+                }
+                if foundTotal && foundRateLimits { break }
+            }
+            position = start
         }
+        metrics.codexBytesRead += roundBytesRead
+        return index
+    }
+
+    private func readCodex(now: TimeInterval, metrics: inout RoundMetrics) -> CodexStatus? {
+        let originalIndexes = codexIndexes
+        var lastMtime: TimeInterval = 0
+        let currentDir = dayDirectory(for: now)
+        let previousDate = Calendar.current.date(byAdding: .day, value: -1,
+                                                 to: Date(timeIntervalSince1970: now))!
+        let previousDir = dayDirectory(for: previousDate.timeIntervalSince1970)
+        guard let currentFiles = jsonlFiles(in: currentDir, recursive: false),
+              let previousFiles = jsonlFiles(in: previousDir, recursive: false) else { return nil }
+        for metadata in currentFiles + previousFiles { lastMtime = max(lastMtime, metadata.mtime) }
+
+        var seen: Set<String> = []
+        for metadata in currentFiles {
+            let path = metadata.url.path
+            seen.insert(path)
+            var index: CodexFileIndex
+            if var existing = codexIndexes[path] {
+                if resetCursorIfNeeded(&existing.cursor, metadata: metadata) {
+                    guard let rebuilt = bootstrapCodex(metadata, metrics: &metrics) else {
+                        codexIndexes = originalIndexes
+                        return nil
+                    }
+                    index = rebuilt
+                } else {
+                    let readSucceeded = readAppended(
+                        metadata,
+                        cursor: &existing.cursor,
+                        bytesRead: &metrics.codexBytesRead
+                    ) { data, range in
+                        guard let values = self.codexValues(in: data, range: range) else { return }
+                        if let total = values.total { existing.totalTokens = max(existing.totalTokens, total) }
+                        if let rateLimits = values.rateLimits,
+                           values.timestamp >= existing.rateLimitsTs {
+                            existing.rateLimits = rateLimits
+                            existing.rateLimitsTs = values.timestamp
+                        }
+                    }
+                    guard readSucceeded else {
+                        codexIndexes = originalIndexes
+                        return nil
+                    }
+                    existing.mtime = metadata.mtime
+                    index = existing
+                }
+            } else {
+                guard let bootstrapped = bootstrapCodex(metadata, metrics: &metrics) else {
+                    codexIndexes = originalIndexes
+                    return nil
+                }
+                index = bootstrapped
+            }
+            codexIndexes[path] = index
+        }
+        codexIndexes = codexIndexes.filter { seen.contains($0.key) }
 
         var s = CodexStatus()
-        s.tokensToday = tokensToday
+        s.tokensToday = codexIndexes.values.reduce(0) { $0 + $1.totalTokens }
         s.status = statusFromDelta(lastMtime > 0 ? now - lastMtime : 1e9)
-        if let rl = latestRateLimits {
-            let primary = rl["primary"] as? [String: Any]
-            let secondary = rl["secondary"] as? [String: Any]
-            s.primaryPct = (primary?["used_percent"] as? NSNumber)?.doubleValue
-            s.primaryWindowMin = (primary?["window_minutes"] as? NSNumber)?.intValue
-            if let reset = (primary?["resets_at"] as? NSNumber)?.doubleValue {
-                s.primaryResetMin = max(0, Int((reset - now) / 60))
-            }
-            s.weeklyPct = (secondary?["used_percent"] as? NSNumber)?.doubleValue
-            s.weeklyWindowMin = (secondary?["window_minutes"] as? NSNumber)?.intValue
-            if let reset = (secondary?["resets_at"] as? NSNumber)?.doubleValue {
-                s.weeklyResetMin = max(0, Int((reset - now) / 60))
-            }
+        if let latest = codexIndexes.values.filter({ $0.rateLimits != nil })
+            .max(by: { $0.rateLimitsTs < $1.rateLimitsTs }), let rl = latest.rateLimits {
+            let quota = Self.parsedCodexQuota(rateLimits: rl, now: now)
+            s.primaryPct = quota.primaryPct
+            s.primaryWindowMin = quota.primaryWindowMin
+            s.primaryResetMin = quota.primaryResetMin
+            s.weeklyPct = quota.weeklyPct
+            s.weeklyWindowMin = quota.weeklyWindowMin
+            s.weeklyResetMin = quota.weeklyResetMin
         }
         return s
     }

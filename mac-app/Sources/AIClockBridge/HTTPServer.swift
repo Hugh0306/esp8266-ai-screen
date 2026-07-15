@@ -6,6 +6,9 @@ import Network
 // (JSON bodies produced per request); everything else is 404. Requests are a
 // single small GET, so we just read until the end of headers and reply.
 final class HTTPServer {
+    static let maxHeaderBytes = 16 * 1024
+    static let maxBodyBytes = 1_000_000
+
     private let port: NWEndpoint.Port
     private let routes: [String: () -> Data]
     private let binaryRoutes: [String: () -> Data]
@@ -17,6 +20,19 @@ final class HTTPServer {
     /// The ESP8266 polls /status constantly, so this is how the app learns
     /// the device's LAN address without any scanning.
     var onRequest: ((String, String) -> Void)?
+    var authorizePost: ((String, String) -> Bool)?
+
+    static func contentLength(in headerLines: [Substring]) -> Int? {
+        var parsed: Int?
+        for line in headerLines where line.lowercased().hasPrefix("content-length:") {
+            let raw = line.dropFirst("content-length:".count)
+                .trimmingCharacters(in: .whitespaces)
+            guard let value = Int(raw), value >= 0, value <= maxBodyBytes else { return nil }
+            if let parsed, parsed != value { return nil }
+            parsed = value
+        }
+        return parsed ?? 0
+    }
 
     init(port: UInt16, routes: [String: () -> Data], binaryRoutes: [String: () -> Data] = [:],
          postRoutes: [String: (Data) -> Data] = [:]) {
@@ -46,6 +62,10 @@ final class HTTPServer {
             var buf = buffer
             if let data = data { buf.append(data) }
             if let range = buf.range(of: Data("\r\n\r\n".utf8)) {
+                guard range.lowerBound <= Self.maxHeaderBytes else {
+                    conn.cancel()
+                    return
+                }
                 let header = String(decoding: buf[..<range.lowerBound], as: UTF8.self)
                 // NB: "\r\n" is a single grapheme cluster in Swift, so a
                 // Character-equality split on "\r"/"\n" never fires — use
@@ -57,23 +77,19 @@ final class HTTPServer {
                 let path = parts.count >= 2 ? String(parts[1]) : "/"
 
                 // POST bodies: wait until Content-Length bytes have arrived.
-                var contentLength = 0
-                for line in headerLines {
-                    let lower = line.lowercased()
-                    if lower.hasPrefix("content-length:") {
-                        contentLength = Int(line.dropFirst("content-length:".count)
-                            .trimmingCharacters(in: .whitespaces)) ?? 0
-                    }
+                guard let contentLength = Self.contentLength(in: headerLines) else {
+                    conn.cancel()
+                    return
                 }
                 let bodyAvailable = buf.count - range.upperBound
-                if method == "POST", bodyAvailable < contentLength, contentLength <= 1_000_000 {
+                if method == "POST", bodyAvailable < contentLength {
                     if isComplete || error != nil { conn.cancel() } else { self.receive(conn, buffer: buf) }
                     return
                 }
                 let bodyEnd = min(buf.count, range.upperBound + contentLength)
                 let requestBody = buf.subdata(in: range.upperBound..<bodyEnd)
                 self.respond(conn, method: method, path: path, requestBody: requestBody)
-            } else if isComplete || error != nil {
+            } else if buf.count > Self.maxHeaderBytes || isComplete || error != nil {
                 conn.cancel()
             } else {
                 self.receive(conn, buffer: buf)
@@ -83,18 +99,29 @@ final class HTTPServer {
 
     private func respond(_ conn: NWConnection, method: String, path: String, requestBody: Data) {
         let clean = path.split(separator: "?").first.map(String.init) ?? path
+        var remoteIP = ""
         if case let .hostPort(host, _) = conn.endpoint {
-            // "192.168.1.4%en0" -> "192.168.1.4"
-            let ip = String(host.debugDescription.split(separator: "%").first ?? "")
-            if !ip.isEmpty { onRequest?(clean, ip) }
+            // "192.0.2.4%en0" -> "192.0.2.4"
+            remoteIP = String(host.debugDescription.split(separator: "%").first ?? "")
+            if !remoteIP.isEmpty { onRequest?(clean, remoteIP) }
         }
         let body: Data
         let statusLine: String
         let contentType: String
-        if method == "POST", let handler = postRoutes[clean] {
-            body = handler(requestBody)
-            statusLine = "200 OK"
-            contentType = "application/json"
+        if method == "OPTIONS" {
+            body = Data()
+            statusLine = "204 No Content"
+            contentType = "text/plain"
+        } else if method == "POST", let handler = postRoutes[clean] {
+            if let authorizePost, !authorizePost(clean, remoteIP) {
+                body = Data("{\"ok\":false,\"error\":\"forbidden\"}".utf8)
+                statusLine = "403 Forbidden"
+                contentType = "application/json"
+            } else {
+                body = handler(requestBody)
+                statusLine = "200 OK"
+                contentType = "application/json"
+            }
         } else if method == "GET", let provider = routes[clean] {
             body = provider()
             statusLine = "200 OK"
@@ -112,6 +139,9 @@ final class HTTPServer {
             + "Content-Type: \(contentType)\r\n"
             + "Content-Length: \(body.count)\r\n"
             + "Access-Control-Allow-Origin: *\r\n"
+            + "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+            + "Access-Control-Allow-Headers: Content-Type\r\n"
+            + "Access-Control-Max-Age: 600\r\n"
             + "Connection: close\r\n\r\n"
         var response = Data(header.utf8)
         response.append(body)

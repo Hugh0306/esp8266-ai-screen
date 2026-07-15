@@ -157,7 +157,11 @@ static class DeviceClient
     }
 
     /// POST /sprite/{claude|codex}/reset — back to the compiled-in animation.
-    public static Task ResetSprite(string slot) => PostForm($"sprite/{slot}/reset", new());
+    public static async Task ResetSprite(string slot)
+    {
+        var info = await FetchInfo();
+        await PostForm($"sprite/{slot}/reset", new() { ["expected_rev"] = info.SpriteRev.ToString() });
+    }
 
     /// GET /sprite/{claude|codex}/raw — the animation the device is actually
     /// using, wire format [1 byte frame count][RGB565 big-endian frames...].

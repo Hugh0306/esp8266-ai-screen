@@ -1,7 +1,7 @@
 import AppKit
 
-// Menu-bar item: a retro Macintosh icon (drawn in code, template so it adapts
-// to light/dark menu bars). Left click opens a live mirror of the ESP8266
+// Menu-bar item: a transparent market-monitor template icon that adapts to
+// light/dark menu bars. Left click opens a live mirror of the ESP8266
 // screen (MirrorPopover); right click opens the control menu with usage
 // meters and device remote control. No quota text lives in the bar itself.
 final class MenuBarController: NSObject, NSMenuDelegate {
@@ -9,6 +9,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private let service: StatusService
     private let usage: UsageFetcher
     private let port: UInt16
+    private let stockMonitor: StockMonitor
     private let controlMenu = NSMenu()
     private let mirrorPopover: MirrorPopoverController
 
@@ -18,31 +19,57 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private var modeItems: [String: NSMenuItem] = [:]
 
     init(service: StatusService, usage: UsageFetcher, netMonitor: NetSpeedMonitor,
-         nowPlaying: NowPlayingMonitor, stockMonitor: StockMonitor, port: UInt16) {
+         stockMonitor: StockMonitor, weatherMonitor: WeatherMonitor, port: UInt16) {
         self.service = service
         self.usage = usage
         self.port = port
+        self.stockMonitor = stockMonitor
         self.mirrorPopover = MirrorPopoverController(service: service, netMonitor: netMonitor,
-                                                     nowPlaying: nowPlaying, stockMonitor: stockMonitor)
+                                                     stockMonitor: stockMonitor,
+                                                     weatherMonitor: weatherMonitor)
         super.init()
         buildMenu()
         if let button = statusItem.button {
-            button.image = Self.retroMacIcon()
+            button.image = Self.marketMonitorIcon()
             button.target = self
             button.action = #selector(statusItemClicked)
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
     }
 
-    /// User-supplied device logo (bezel + dark screen + smiley + green status
-    /// dot). Full-color, so NOT a template image — it keeps its colors in
-    /// both light and dark menu bars.
-    private static func retroMacIcon() -> NSImage {
-        guard let img = Bundle.module.image(forResource: "happy-mac") else {
-            return NSImage(size: NSSize(width: 18, height: 18))
+    /// Monochrome template artwork keeps the menu-bar background transparent
+    /// and lets macOS choose the correct foreground color for each appearance.
+    private static func marketMonitorIcon() -> NSImage {
+        let size = NSSize(width: 18, height: 18)
+        let img = NSImage(size: size, flipped: false) { _ in
+            NSColor.black.setStroke()
+
+            let monitor = NSBezierPath(roundedRect: NSRect(x: 1.5, y: 3.5, width: 15, height: 12),
+                                       xRadius: 2, yRadius: 2)
+            monitor.lineWidth = 1.35
+            monitor.stroke()
+
+            let chart = NSBezierPath()
+            chart.move(to: NSPoint(x: 4, y: 7))
+            chart.line(to: NSPoint(x: 7, y: 9.5))
+            chart.line(to: NSPoint(x: 9.5, y: 8.2))
+            chart.line(to: NSPoint(x: 14, y: 12.2))
+            chart.lineWidth = 1.55
+            chart.lineCapStyle = .round
+            chart.lineJoinStyle = .round
+            chart.stroke()
+
+            let stand = NSBezierPath()
+            stand.move(to: NSPoint(x: 7, y: 1.8))
+            stand.line(to: NSPoint(x: 11, y: 1.8))
+            stand.move(to: NSPoint(x: 9, y: 1.8))
+            stand.line(to: NSPoint(x: 9, y: 3.5))
+            stand.lineWidth = 1.35
+            stand.lineCapStyle = .round
+            stand.stroke()
+            return true
         }
-        img.size = NSSize(width: 18, height: 18)
-        img.isTemplate = false
+        img.isTemplate = true
         return img
     }
 
@@ -81,7 +108,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         let displayMenu = NSMenu()
         for (title, mode) in [("自动（谁在干活显示谁）", "auto"), ("固定 Claude", "claude"),
                               ("固定 Codex", "codex"), ("网速曲线", "net"),
-                              ("音乐播放", "music"), ("股票行情", "stock")] {
+                              ("天气时钟", "weather"), ("股票行情", "stock")] {
             let item = NSMenuItem(title: title, action: #selector(setDisplayMode(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = mode
@@ -93,7 +120,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         menu.addItem(displayItem)
         // (屏幕亮度在左键弹出的镜像页底部，做成滑条了)
 
-        menu.addItem(makeItem("设置自选股…", #selector(setStockSymbols)))
+        menu.addItem(makeItem("设置行情品种…", #selector(setStockSymbols)))
 
         menu.addItem(makeItem("更换桌宠动画…（petdex）", #selector(openPetPicker)))
 
@@ -136,7 +163,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     }
 
     private static func usageLine(name: String, u: ProviderUsage, weeklyLabel: String) -> String {
-        if let err = u.error, u.primaryPct == nil { return "\(name)：\(err)" }
+        if let err = u.error, u.primaryPct == nil, u.weeklyPct == nil { return "\(name)：\(err)" }
         var parts: [String] = []
         if let p = u.primaryPct {
             var s = "5h \(Int(p))%"
@@ -172,25 +199,18 @@ final class MenuBarController: NSObject, NSMenuDelegate {
                 let sprites = [info.claudeCustomSprite ? "C:自定义" : "C:默认",
                                info.codexCustomSprite ? "X:自定义" : "X:默认"]
                 let showing = info.mode == "net" ? "网速"
-                    : info.mode == "music" ? "音乐"
+                    : (info.mode == "weather" || info.mode == "music") ? "天气"
+                    : info.mode == "stock" ? "股票"
                     : (info.showing == "claude" ? "Claude" : "Codex")
                 self.deviceInfoItem.title =
                     "设备：\(info.ip) · 正在显示 \(showing) · \(sprites.joined(separator: " "))"
-                for (mode, item) in self.modeItems { item.state = mode == info.mode ? .on : .off }
+                for (mode, item) in self.modeItems {
+                    let selected = mode == info.mode || (mode == "weather" && info.mode == "music")
+                    item.state = selected ? .on : .off
+                }
             case .failure:
                 self.deviceInfoItem.title = "设备：\(host)（无法连接）"
                 self.modeItems.values.forEach { $0.state = .off }
-                // self-heal: the device may have moved to a new DHCP address;
-                // if it recently polled us from a different IP, adopt that.
-                let seen = DeviceClient.lastSeenIP
-                if !seen.isEmpty, !host.hasPrefix(seen) {
-                    DeviceClient.verifyDevice(ip: seen) { ok in
-                        if ok {
-                            DeviceClient.host = seen
-                            self.refreshDeviceSection()
-                        }
-                    }
-                }
             }
         }
     }
@@ -201,16 +221,19 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         deviceInfoItem.title = "设备：正在查找…"
         DeviceClient.autoPair(progress: { [weak self] msg in
             self?.deviceInfoItem.title = "设备：\(msg)"
-        }, completion: { [weak self] ip in
-            if let ip = ip {
+        }, completion: { [weak self] result in
+            switch result {
+            case let .paired(ip):
                 Self.toast("配对成功", "已找到设备并配对：\(ip)")
                 self?.refreshDeviceSection()
-            } else {
+            case .notFound:
                 Self.toast("未找到设备", """
                 局域网内没有发现 ESP8266 时钟。请确认：
                 1. 设备已通电并连上同一个 WiFi（首次使用需通过 AI-Clock-Setup 热点配网）
                 2. 路由器未开启"客户端隔离"
                 """)
+                self?.refreshDeviceSection()
+            case .cancelled:
                 self?.refreshDeviceSection()
             }
         })
@@ -227,10 +250,10 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     @objc private func setDeviceAddress() {
         let alert = NSAlert()
         alert.messageText = "设备地址"
-        alert.informativeText = "ESP8266 时钟的 IP（设备开机时屏幕上会显示，例如 192.168.1.50）"
+        alert.informativeText = "ESP8266 时钟的 IP（设备开机时屏幕上会显示，例如 192.0.2.10）"
         let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
         input.stringValue = DeviceClient.host
-        input.placeholderString = "192.168.1.50"
+        input.placeholderString = "192.0.2.10"
         alert.accessoryView = input
         alert.addButton(withTitle: "保存")
         alert.addButton(withTitle: "取消")
@@ -262,18 +285,22 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 
     @objc private func setStockSymbols() {
         let alert = NSAlert()
-        alert.messageText = "自选股"
-        alert.informativeText = "逗号分隔的腾讯行情代码：sh/sz=A股、hk=港股、us=美股\n例如 sh600519,hk00700,usAAPL（设备最多显示 4 只）"
+        alert.messageText = "行情品种"
+        alert.informativeText = "BTCUSDT、ETHUSDT、ETHBTC 使用 OKX；QQQ、TSLA 等美股使用腾讯。\n逗号分隔，去重后最多 4 个。"
         let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
         input.stringValue = StockMonitor.symbols.joined(separator: ",")
-        input.placeholderString = "sh000001,usAAPL"
+        input.placeholderString = "usQQQ,BTCUSDT,ETHUSDT,ETHBTC"
         alert.accessoryView = input
         alert.addButton(withTitle: "保存")
         alert.addButton(withTitle: "取消")
         NSApp.activate(ignoringOtherApps: true)
         if alert.runModal() == .alertFirstButtonReturn {
-            StockMonitor.symbols = input.stringValue.split(separator: ",")
-                .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+            let values = input.stringValue.replacingOccurrences(of: "，", with: ",")
+                .split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            if case let .failure(error) = stockMonitor.updateSymbols(values) {
+                Self.toast("保存失败", error.localizedDescription)
+            }
         }
     }
 

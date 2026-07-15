@@ -242,8 +242,8 @@ sealed class TrayAppContext : ApplicationContext
     {
         var input = InputDialog.Show(
             "设备地址",
-            "ESP8266 时钟的 IP（设备开机时屏幕上会显示，例如 192.168.1.50）",
-            DeviceClient.Host, "192.168.1.50");
+            "ESP8266 时钟的 IP（设备开机时屏幕上会显示，例如 192.0.2.10）",
+            DeviceClient.Host, "192.0.2.10");
         if (input == null) return;
         DeviceClient.Host = input.Trim();
         _ = RefreshDeviceSection();

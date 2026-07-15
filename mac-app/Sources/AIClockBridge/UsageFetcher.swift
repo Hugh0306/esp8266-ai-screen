@@ -6,7 +6,8 @@ import Foundation
 //           ~/.claude/.credentials.json), then GET
 //           https://api.anthropic.com/api/oauth/usage  (5h + 7d windows)
 //   Codex:  token from ~/.codex/auth.json, then GET
-//           https://chatgpt.com/backend-api/wham/usage (5h + weekly windows)
+//           https://chatgpt.com/backend-api/wham/usage (weekly window; older
+//           accounts may also have a 5h window)
 // Tokens never leave this machine except toward their own vendor's API.
 
 struct ProviderUsage {
@@ -17,6 +18,29 @@ struct ProviderUsage {
     var error: String?
     var fetchedAt: Date?
     var rateLimited = false
+}
+
+struct CodexQuotaWindow {
+    let usedPercent: Double?
+    let windowMinutes: Int
+    let resetsAt: Double?
+}
+
+struct ClassifiedCodexQuota {
+    var primary: CodexQuotaWindow?
+    var weekly: CodexQuotaWindow?
+}
+
+func classifyCodexQuota(_ windows: [CodexQuotaWindow]) -> ClassifiedCodexQuota {
+    var result = ClassifiedCodexQuota()
+    for window in windows {
+        if window.windowMinutes >= 2 * 24 * 60 {
+            if result.weekly?.usedPercent == nil { result.weekly = window }
+        } else if result.primary?.usedPercent == nil {
+            result.primary = window
+        }
+    }
+    return result
 }
 
 final class UsageFetcher {
@@ -70,7 +94,8 @@ final class UsageFetcher {
     }
 
     private static func merge(old: ProviderUsage, new: ProviderUsage) -> ProviderUsage {
-        if new.primaryPct == nil && new.weeklyPct == nil && old.primaryPct != nil {
+        if new.primaryPct == nil && new.weeklyPct == nil
+                && (old.primaryPct != nil || old.weeklyPct != nil) {
             var kept = old
             kept.error = new.error
             return kept
@@ -93,10 +118,12 @@ final class UsageFetcher {
         req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
         req.setValue("claude-code/2.1.0", forHTTPHeaderField: "User-Agent")
 
-        guard let (data, code) = Self.syncRequest(req) else {
-            usage.error = "Claude 用量请求失败"
+        let resp = Self.syncRequest(req)
+        guard let data = resp.data else {
+            usage.error = "Claude 用量请求失败：\(resp.error ?? "无响应")"
             return usage
         }
+        let code = resp.code
         guard code == 200 else {
             usage.rateLimited = code == 429
             usage.error = code == 401 ? "Claude 凭据过期，运行 claude 重新登录"
@@ -166,10 +193,12 @@ final class UsageFetcher {
             req.setValue(account, forHTTPHeaderField: "ChatGPT-Account-Id")
         }
 
-        guard let (data, code) = Self.syncRequest(req) else {
-            usage.error = "Codex 用量请求失败"
+        let resp = Self.syncRequest(req)
+        guard let data = resp.data else {
+            usage.error = "Codex 用量请求失败：\(resp.error ?? "无响应")"
             return usage
         }
+        let code = resp.code
         guard (200...299).contains(code) else {
             usage.error = code == 401 || code == 403 ? "Codex 凭据过期，运行 codex 重新登录" : "Codex 用量接口 HTTP \(code)"
             return usage
@@ -179,20 +208,36 @@ final class UsageFetcher {
             usage.error = "Codex 用量响应解析失败"
             return usage
         }
-        let now = Date().timeIntervalSince1970
-        if let w = rateLimit["primary_window"] as? [String: Any] {
-            usage.primaryPct = (w["used_percent"] as? NSNumber)?.doubleValue
-            if let reset = (w["reset_at"] as? NSNumber)?.doubleValue {
-                usage.primaryResetMin = max(0, Int((reset - now) / 60))
-            }
+        return Self.parsedCodexUsage(rateLimit: rateLimit, now: Date().timeIntervalSince1970)
+    }
+
+    static func parsedCodexUsage(rateLimit: [String: Any], now: Double) -> ProviderUsage {
+        var windows: [CodexQuotaWindow] = []
+        for (key, fallbackSeconds) in [
+            ("primary_window", 5.0 * 3600),
+            ("secondary_window", 7.0 * 86400),
+        ] {
+            guard let window = rateLimit[key] as? [String: Any] else { continue }
+            let seconds = (window["limit_window_seconds"] as? NSNumber)?.doubleValue
+                ?? fallbackSeconds
+            windows.append(CodexQuotaWindow(
+                usedPercent: (window["used_percent"] as? NSNumber)?.doubleValue,
+                windowMinutes: max(0, Int(seconds / 60)),
+                resetsAt: (window["reset_at"] as? NSNumber)?.doubleValue
+            ))
         }
-        if let w = rateLimit["secondary_window"] as? [String: Any] {
-            usage.weeklyPct = (w["used_percent"] as? NSNumber)?.doubleValue
-            if let reset = (w["reset_at"] as? NSNumber)?.doubleValue {
-                usage.weeklyResetMin = max(0, Int((reset - now) / 60))
-            }
+
+        let classified = classifyCodexQuota(windows)
+        var usage = ProviderUsage()
+        if let window = classified.primary {
+            usage.primaryPct = window.usedPercent
+            usage.primaryResetMin = window.resetsAt.map { max(0, Int(($0 - now) / 60)) }
         }
-        usage.fetchedAt = Date()
+        if let window = classified.weekly {
+            usage.weeklyPct = window.usedPercent
+            usage.weeklyResetMin = window.resetsAt.map { max(0, Int(($0 - now) / 60)) }
+        }
+        usage.fetchedAt = Date(timeIntervalSince1970: now)
         return usage
     }
 
@@ -240,12 +285,14 @@ final class UsageFetcher {
         return max(0, Int((d.timeIntervalSince1970 - now) / 60))
     }
 
-    private static func syncRequest(_ req: URLRequest) -> (Data, Int)? {
+    private static func syncRequest(_ req: URLRequest) -> (data: Data?, code: Int, error: String?) {
         let sem = DispatchSemaphore(value: 0)
-        var result: (Data, Int)?
-        URLSession.shared.dataTask(with: req) { data, resp, _ in
+        var result: (data: Data?, code: Int, error: String?) = (nil, 0, "无响应")
+        URLSession.shared.dataTask(with: req) { data, resp, error in
             if let data = data, let http = resp as? HTTPURLResponse {
-                result = (data, http.statusCode)
+                result = (data, http.statusCode, nil)
+            } else {
+                result = (nil, 0, error?.localizedDescription ?? "无响应")
             }
             sem.signal()
         }.resume()
